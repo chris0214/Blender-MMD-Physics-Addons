@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "pmx_physics"
+version = "1.0.0"
+name = "PMX Physics"
+tagline = "External Bullet 2.82 runtime for mmd_tools PMX rigid bodies"
+maintainer = "克里斯提亚娜"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Animation"]
