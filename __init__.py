@@ -2,7 +2,7 @@ bl_info = {
     "name": "PMX Physics",
     "author": "克里斯提亚娜",
     "maintainer": "克里斯提亚娜",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > PMX Physics",
     "description": "External Bullet 2.82 runtime for mmd_tools PMX rigid bodies",

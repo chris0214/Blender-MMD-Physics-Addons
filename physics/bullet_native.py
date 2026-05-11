@@ -1,5 +1,6 @@
 import ctypes
 import os
+import sys
 
 from mathutils import Quaternion, Vector
 
@@ -89,13 +90,26 @@ def _matrix_to_native_transform(matrix, index):
 
 
 class BulletNative:
-    def __init__(self, dll_path):
-        self.dll_path = os.path.abspath(dll_path)
-        if not os.path.exists(self.dll_path):
-            raise NativeError(f"Bullet DLL not found: {self.dll_path}")
-        self.lib = ctypes.CDLL(self.dll_path)
+    def __init__(self, dll_path=None):
+        self.dll_path = os.path.abspath(dll_path) if dll_path else ""
+        self.lib = self._load_library()
         self.handle = None
         self._bind()
+
+    def _load_library(self):
+        try:
+            process_lib = ctypes.CDLL(sys.executable if os.name == "nt" else None)
+            getattr(process_lib, "pmx_bullet_api_version")
+            self.dll_path = "<Blender internal>"
+            return process_lib
+        except (AttributeError, OSError):
+            pass
+
+        if not self.dll_path:
+            raise NativeError("Internal PMX Bullet runtime not found and no Bullet DLL path was provided")
+        if not os.path.exists(self.dll_path):
+            raise NativeError(f"Bullet DLL not found: {self.dll_path}")
+        return ctypes.CDLL(self.dll_path)
 
     def _bind(self):
         lib = self.lib

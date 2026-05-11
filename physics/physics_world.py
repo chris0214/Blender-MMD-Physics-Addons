@@ -211,6 +211,7 @@ class PhysicsWorld:
         self._physics_pose_bones = []
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
+        self._last_root_world = None
         self.performance = _new_performance()
 
     def initialize(
@@ -284,6 +285,7 @@ class PhysicsWorld:
         )
         self._sync_to_start_pose(target_matrices, startup_sync_steps)
         self._prewarm(self._prewarm_steps)
+        self._last_root_world = self.model.root.matrix_world.copy()
         self.flush_depsgraph()
 
     def destroy(self, restore_initial=False):
@@ -310,6 +312,7 @@ class PhysicsWorld:
         self._physics_pose_bones = []
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
+        self._last_root_world = None
         self.performance = _new_performance()
 
     def set_initial_snapshot(self, snapshot):
@@ -328,6 +331,7 @@ class PhysicsWorld:
         self._last_bone_targets = {}
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
+        self._last_root_world = self.model.root.matrix_world.copy()
         self.native.temporal_kinematic_init(self._current_body_matrices(include_dynamic=True))
         self._last_kinematic_matrices = self._copy_matrices(self._current_body_matrices(include_dynamic=False))
         self._prewarm(self._prewarm_steps)
@@ -342,6 +346,7 @@ class PhysicsWorld:
         self._last_bone_targets = {}
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
+        self._last_root_world = self.model.root.matrix_world.copy()
         initial_matrices = self._current_body_matrices(include_dynamic=True)
         self.native.temporal_kinematic_init(initial_matrices)
         self._last_kinematic_matrices = self._copy_matrices(self._current_body_matrices(include_dynamic=False))
@@ -435,6 +440,7 @@ class PhysicsWorld:
 
     def step(self, timestep, max_substeps, apply_results=True):
         start_time = time.perf_counter()
+        self._preserve_dynamic_world_space_on_root_motion()
         collect_start = start_time
         kinematic_matrices = self._current_body_matrices(include_dynamic=False)
         collect_ms = (time.perf_counter() - collect_start) * 1000.0
@@ -451,6 +457,8 @@ class PhysicsWorld:
             apply_start = time.perf_counter()
             self._apply_body_matrices(body_matrices)
             apply_ms = (time.perf_counter() - apply_start) * 1000.0
+        if self.model is not None and self.model.root is not None:
+            self._last_root_world = self.model.root.matrix_world.copy()
         self._record_step_time(
             (time.perf_counter() - start_time) * 1000.0,
             {
@@ -460,6 +468,33 @@ class PhysicsWorld:
                 "apply_ms": apply_ms,
             },
         )
+
+    def _preserve_dynamic_world_space_on_root_motion(self):
+        if self.native is None or self.model is None or self.model.root is None:
+            return
+
+        previous_root = self._last_root_world
+        current_root = self.model.root.matrix_world.copy()
+        if previous_root is None:
+            self._last_root_world = current_root
+            return
+
+        move, angle = self._matrix_delta(previous_root, current_root)
+        if move <= 1.0e-6 and angle <= 1.0e-5:
+            return
+
+        root_inverse = current_root.inverted_safe()
+        body_matrices = self.native.get_body_transforms(len(self.model.rigid_bodies))
+        adjusted = {}
+        for rigid in self.model.rigid_bodies:
+            if rigid.mode not in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                continue
+            matrix = body_matrices.get(rigid.index)
+            if matrix is None:
+                continue
+            adjusted[rigid.index] = root_inverse @ previous_root @ matrix
+        if adjusted:
+            self.native.temporal_kinematic_init(adjusted)
 
     def _record_step_time(self, elapsed_ms, stages=None):
         count = int(self.performance.get("step_count", 0)) + 1
@@ -797,11 +832,15 @@ class PhysicsWorld:
             self.performance["last_object_writes"] = object_writes
             return
 
-        source_bones = self._physics_pose_bones or armature.pose.bones
-        original_basis_matrices = {bone.name: bone.matrix_basis.copy() for bone in source_bones}
+        ordered_items = self._ordered_bone_targets(bone_targets)
+        source_bones = self._physics_pose_bones if self._physics_pose_bones else [item[1][0] for item in ordered_items]
+        original_basis_matrices = {
+            bone.name: bone.matrix_basis.copy()
+            for bone in source_bones
+            if bone.name in bone_targets
+        }
         applied_matrices = {}
         bone_writes = 0
-        ordered_items = self._ordered_bone_targets(bone_targets)
         for bone_name, (pose_bone, mode, bone_matrix_armature) in ordered_items:
             if mode == MODE_DYNAMIC:
                 target_matrix = bone_matrix_armature

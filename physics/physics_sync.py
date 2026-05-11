@@ -302,10 +302,12 @@ class TimerController:
             if self.accumulator < fixed_step:
                 return max(0.001, min(fixed_step * 0.5, fixed_step - self.accumulator))
 
-            self.world.configure_apply_options(_full_apply_options())
-            flush_start = time.perf_counter()
-            self.world.flush_depsgraph()
-            flush_ms = (time.perf_counter() - flush_start) * 1000.0
+            self.world.configure_apply_options(_realtime_apply_options(self.settings))
+            flush_ms = 0.0
+            if self.has_armature_action:
+                flush_start = time.perf_counter()
+                self.world.flush_depsgraph()
+                flush_ms = (time.perf_counter() - flush_start) * 1000.0
             while self.accumulator >= fixed_step and steps < max_steps:
                 next_steps = steps + 1
                 apply_results = self.accumulator < fixed_step * 2.0 or next_steps >= max_steps
@@ -313,9 +315,10 @@ class TimerController:
                 self.accumulator -= fixed_step
                 steps += 1
             if steps:
-                flush_start = time.perf_counter()
-                self.world.flush_depsgraph()
-                flush_ms += (time.perf_counter() - flush_start) * 1000.0
+                if self._last_step_wrote_results():
+                    flush_start = time.perf_counter()
+                    self.world.flush_depsgraph()
+                    flush_ms += (time.perf_counter() - flush_start) * 1000.0
                 self.world.record_flush_time(flush_ms)
                 self.world.record_tick_time((time.perf_counter() - tick_start) * 1000.0, steps)
                 _publish_performance(self.settings, self.world)
@@ -326,6 +329,13 @@ class TimerController:
             self.settings.is_running = False
             self.stop()
             return None
+
+    def _last_step_wrote_results(self):
+        performance = getattr(self.world, "performance", {})
+        return (
+            int(performance.get("last_bone_writes", 0)) > 0
+            or int(performance.get("last_object_writes", 0)) > 0
+        )
 
     def _sync_changed_scene_frame(self, fixed_step):
         if self._internal_frame_set:
