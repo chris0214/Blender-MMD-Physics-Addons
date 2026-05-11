@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pmx_physics"
-version = "1.0.0"
+version = "1.1.0"
 name = "PMX Physics"
 tagline = "External Bullet 2.82 runtime for mmd_tools PMX rigid bodies"
 maintainer = "克里斯提亚娜"

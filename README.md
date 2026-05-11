@@ -1,10 +1,17 @@
-# PMX Physics 1.0.0
+# PMX Physics 1.1.0
 
 PMX Physics 是一个 Blender 4.2+ 插件，用于在 Blender 中直接模拟 mmd_tools 导入的 PMX 模型刚体物理。插件通过外部 `pmx_bullet.dll` 使用 Bullet 2.82 r2704，而不是 Blender 内置刚体系统，目标是尽量接近 MMD / PMXEditor TransformView 的物理行为。
 
 作者 / 维护者：克里斯提亚娜  
 许可证：GPL-3.0-or-later  
 插件类型：Blender Add-on / Extension  
+
+## 1.1.0 更新
+
+- 基于 `pmx_physics-1.0.0` 稳定版整理发布。
+- 修复实时模拟时拖动 mmd_tools 模型根空物体没有物理反馈的问题。
+- 运行中移动或旋转模型根对象时，动态刚体会保留上一刻世界空间位置，再由 Bullet 继续解算，因此头发、裙摆、尾巴等物理部件会产生拖拽惯性。
+- 该版本仍使用 Bullet 2.82 r2704 native DLL，DLL API 版本为 6。
 
 ## 1. 功能概览
 
@@ -22,7 +29,7 @@ PMX Physics 是一个 Blender 4.2+ 插件，用于在 Blender 中直接模拟 mm
 推荐使用发布包：
 
 ```text
-pmx_physics-1.0.0.zip
+pmx_physics-1.1.0.zip
 ```
 
 安装步骤：
@@ -30,7 +37,7 @@ pmx_physics-1.0.0.zip
 1. 打开 Blender 4.2 或更新版本。
 2. 进入 `Edit > Preferences > Add-ons`。
 3. 点击 `Install...`。
-4. 选择 `pmx_physics-1.0.0.zip`。
+4. 选择 `pmx_physics-1.1.0.zip`。
 5. 启用 `PMX Physics`。
 6. 在 3D View 右侧 Sidebar 中打开 `PMX Physics` 面板。
 
@@ -461,7 +468,7 @@ Python 侧会检查 native API 版本，避免 DLL 和脚本不匹配。
 当前版本：
 
 ```text
-PMX Physics 1.0.0
+PMX Physics 1.1.0
 ```
 
 Blender 要求：
