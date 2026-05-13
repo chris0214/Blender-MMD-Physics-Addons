@@ -59,6 +59,19 @@ QUALITY_PRESETS = {
         "locked_joint_pullback": True,
         "resting_body_stabilization": False,
     },
+    "PREVIEW": {
+        "fixed_timestep_preset": "HZ_30",
+        "max_substeps": 1,
+        "prewarm_steps": 0,
+        "solver_iterations": 10,
+        "use_frame_offset": True,
+        "joint_stop_erp": 0.5,
+        "joint_stop_cfm": 0.1,
+        "locked_joint_stop_erp": 0.5,
+        "locked_joint_stop_cfm": 0.1,
+        "locked_joint_pullback": True,
+        "resting_body_stabilization": True,
+    },
 }
 
 
@@ -140,11 +153,51 @@ ZONE_RULE_PRESETS = {
 }
 
 
+class PMXPhysicsModelSlot(bpy.types.PropertyGroup):
+    root: bpy.props.PointerProperty(
+        name="Model Root",
+        description="mmd_tools root object for one PMX model in independent multi-model simulation",
+        type=bpy.types.Object,
+    )
+
+    enabled: bpy.props.BoolProperty(
+        name="Enabled",
+        description="Include this model when starting or scanning all configured models",
+        default=True,
+    )
+
+
 class PMXPhysicsSettings(bpy.types.PropertyGroup):
     model_root: bpy.props.PointerProperty(
         name="Model Root",
         description="mmd_tools root object for the PMX model",
         type=bpy.types.Object,
+    )
+
+    model_roots: bpy.props.CollectionProperty(
+        name="Model List",
+        description="PMX model roots used by independent multi-model simulation",
+        type=PMXPhysicsModelSlot,
+    )
+
+    model_root_index: bpy.props.IntProperty(
+        name="Model Index",
+        description="Selected PMX model list item",
+        default=0,
+        min=0,
+        options={"SKIP_SAVE"},
+    )
+
+    multi_model_mode: bpy.props.EnumProperty(
+        name="Multi Model Mode",
+        description="How Start All simulates multiple PMX models",
+        items=(
+            ("INDEPENDENT", "Independent Worlds", "Each PMX model uses its own Bullet world and never collides with other models"),
+            ("ROOT_ISOLATED", "Root Isolated", "Stable per-root isolation; kept for compatibility with older saved settings"),
+            ("SHARED_COLLISION", "Shadow Collision", "Babylon-MMD-style per-model Bullet worlds with kinematic shadow colliders for inter-model collision"),
+            ("GLOBAL_SHARED", "Full Shared World", "Experimental: all enabled models share one dynamic Bullet world from simulation start"),
+        ),
+        default="ROOT_ISOLATED",
     )
 
     dll_path: bpy.props.StringProperty(
@@ -268,6 +321,11 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
                 "DEFAULT",
                 "Default",
                 "Default ERP/CFM and low max-substep solver settings",
+            ),
+            (
+                "PREVIEW",
+                "Preview",
+                "Low-end viewport preview preset with fewer steps and solver iterations",
             ),
         ),
         default="DEFAULT",
@@ -469,6 +527,59 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
         default=False,
     )
 
+    realtime_follow_root_motion: bpy.props.BoolProperty(
+        name="Follow Root Motion",
+        description="Move dynamic rigid bodies with the PMX model root during realtime dragging",
+        default=True,
+    )
+
+    realtime_drag_compensation: bpy.props.BoolProperty(
+        name="Fast Drag Protection",
+        description="Use adaptive extra physics segments when the model or bone-driven bodies move quickly",
+        default=True,
+    )
+
+    realtime_drag_compensate_static: bpy.props.BoolProperty(
+        name="Static Body Compensation",
+        description="Include bone-driven static collision bodies in fast-drag adaptive smoothing",
+        default=True,
+    )
+
+    realtime_drag_compensate_dynamic_bone: bpy.props.BoolProperty(
+        name="Dynamic Bone Compensation",
+        description="Include dynamic-bone rigid bodies in fast-drag adaptive smoothing",
+        default=True,
+    )
+
+    realtime_drag_max_segments: bpy.props.IntProperty(
+        name="Max Drag Segments",
+        description="Maximum internal physics segments used for one fast drag update",
+        default=32,
+        min=1,
+        max=96,
+    )
+
+    realtime_drag_resync: bpy.props.BoolProperty(
+        name="Extreme Drag Resync",
+        description="Temporarily align dynamic rigid bodies when a drag jump is too large for continuous simulation",
+        default=True,
+    )
+
+    realtime_drag_resync_threshold: bpy.props.FloatProperty(
+        name="Resync Threshold",
+        description="Model-space movement in one update that triggers extreme drag resync",
+        default=0.5,
+        min=0.01,
+        max=5.0,
+        precision=3,
+    )
+
+    realtime_drag_resync_clear_velocity: bpy.props.BoolProperty(
+        name="Clear Velocity On Resync",
+        description="Clear dynamic rigid-body velocity after extreme drag resync for a more stable but less inertial preview",
+        default=False,
+    )
+
     realtime_skip_unchanged_bones: bpy.props.BoolProperty(
         name="Skip Unchanged Bones",
         description="Skip Blender bone writes when the physics target changed less than the realtime write threshold",
@@ -627,6 +738,13 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
     perf_max_smoothing_segments: bpy.props.IntProperty(name="Max Smoothing Segments", default=1, options={"SKIP_SAVE"})
     perf_last_bone_writes: bpy.props.IntProperty(name="Bone Writes", default=0, options={"SKIP_SAVE"})
     perf_last_object_writes: bpy.props.IntProperty(name="Object Writes", default=0, options={"SKIP_SAVE"})
+    perf_last_contact_pairs: bpy.props.IntProperty(name="Contact Pairs", default=0, options={"SKIP_SAVE"})
+    perf_last_shared_active_models: bpy.props.IntProperty(name="Active Models", default=0, options={"SKIP_SAVE"})
+    perf_last_changed_models: bpy.props.IntProperty(name="Changed Models", default=0, options={"SKIP_SAVE"})
+    perf_last_contact_models: bpy.props.IntProperty(name="Contact Models", default=0, options={"SKIP_SAVE"})
+    perf_last_disabled_model_pairs: bpy.props.IntProperty(name="Disabled Model Pairs", default=0, options={"SKIP_SAVE"})
+    perf_last_writeback_models: bpy.props.IntProperty(name="Writeback Models", default=0, options={"SKIP_SAVE"})
+    perf_last_contact_detect_ms: bpy.props.FloatProperty(name="Contact Detect ms", default=0.0, precision=3, options={"SKIP_SAVE"})
 
     def resolved_dll_path(self):
         path = self.dll_path.strip()

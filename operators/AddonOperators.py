@@ -11,6 +11,24 @@ def _settings(context):
     return context.scene.pmx_physics
 
 
+def _model_slot_roots(settings):
+    return [item.root for item in settings.model_roots if item.root is not None]
+
+
+def _add_model_slot(settings, root):
+    if root is None:
+        return False
+    for item in settings.model_roots:
+        if item.root == root:
+            item.enabled = True
+            return False
+    item = settings.model_roots.add()
+    item.root = root
+    item.enabled = True
+    settings.model_root_index = len(settings.model_roots) - 1
+    return True
+
+
 def _set_scan_status(settings, model, diagnostics=None):
     matched_rules = getattr(model, "zone_rules", [])
     parent_chain_corrections = int(getattr(model, "parent_chain_corrections", 0))
@@ -54,6 +72,65 @@ class PMXPHYSICS_OT_use_active_model(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PMXPHYSICS_OT_add_active_model(bpy.types.Operator):
+    bl_idname = "pmx_physics.add_active_model"
+    bl_label = "Add Active Model"
+    bl_description = "Add the active mmd_tools model root to the independent simulation list"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        root = pmx_data_reader.find_root_object(context.active_object)
+        if root is None:
+            self.report({"ERROR"}, iface_("Active object is not under an mmd_tools model root"))
+            return {"CANCELLED"}
+        settings.model_root = root
+        added = _add_model_slot(settings, root)
+        action = iface_("Added") if added else iface_("Already in model list")
+        settings.status = f"{action}: {root.name}"
+        return {"FINISHED"}
+
+
+class PMXPHYSICS_OT_remove_model_slot(bpy.types.Operator):
+    bl_idname = "pmx_physics.remove_model_slot"
+    bl_label = "Remove Model"
+    bl_description = "Remove the selected model from the independent simulation list"
+    bl_options = {"REGISTER"}
+
+    index: bpy.props.IntProperty(default=-1, options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        settings = _settings(context)
+        index = int(self.index)
+        if index < 0:
+            index = int(settings.model_root_index)
+        if index < 0 or index >= len(settings.model_roots):
+            settings.status = iface_("No model list item selected")
+            return {"CANCELLED"}
+        root = settings.model_roots[index].root
+        name = root.name if root is not None else iface_("Unknown")
+        settings.model_roots.remove(index)
+        settings.model_root_index = min(index, max(0, len(settings.model_roots) - 1))
+        settings.status = f"{iface_('Removed')}: {name}"
+        return {"FINISHED"}
+
+
+class PMXPHYSICS_OT_clear_model_slots(bpy.types.Operator):
+    bl_idname = "pmx_physics.clear_model_slots"
+    bl_label = "Clear Models"
+    bl_description = "Clear the independent simulation model list"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        count = len(settings.model_roots)
+        while len(settings.model_roots):
+            settings.model_roots.remove(len(settings.model_roots) - 1)
+        settings.model_root_index = 0
+        settings.status = f"{iface_('Cleared')} {count} {iface_('model(s)')}"
+        return {"FINISHED"}
+
+
 class PMXPHYSICS_OT_scan_model(bpy.types.Operator):
     bl_idname = "pmx_physics.scan_model"
     bl_label = "Scan Model"
@@ -79,6 +156,62 @@ class PMXPHYSICS_OT_scan_model(bpy.types.Operator):
 
         settings.model_root = model.root
         _set_scan_status(settings, model, diagnostics)
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
+class PMXPHYSICS_OT_scan_all_models(bpy.types.Operator):
+    bl_idname = "pmx_physics.scan_all_models"
+    bl_label = "Scan All Models"
+    bl_description = "Read all enabled mmd_tools model roots in the independent simulation list"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        roots = [item.root for item in settings.model_roots if item.root is not None and item.enabled]
+        if not roots:
+            settings.status = iface_("No enabled models in list")
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+
+        total_bodies = 0
+        total_joints = 0
+        total_pairs = 0
+        names = []
+        warnings = []
+        for root in roots:
+            diagnostics = pmx_data_reader.diagnose_model(context, root)
+            if diagnostics["errors"]:
+                warnings.append(f"{root.name}: {'; '.join(diagnostics['errors'])}")
+                continue
+            try:
+                model = pmx_data_reader.read_model(context, root)
+            except Exception as exc:
+                warnings.append(f"{root.name}: {exc}")
+                continue
+            total_bodies += len(model.rigid_bodies)
+            total_joints += len(model.joints)
+            total_pairs += len(model.non_collision_pairs)
+            names.append(root.name)
+
+        if not names:
+            settings.status = "; ".join(warnings) if warnings else iface_("No valid models found")
+            settings.scan_summary = ""
+            settings.scan_warnings = settings.status
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+
+        settings.perf_body_count = total_bodies
+        settings.perf_joint_count = total_joints
+        settings.perf_pair_count = total_pairs
+        settings.scan_summary = (
+            f"{len(names)} {iface_('model(s)')}, "
+            f"{total_bodies} {iface_('bodies')}, "
+            f"{total_joints} {iface_('joints')}, "
+            f"{total_pairs} {iface_('no-collision pairs')}"
+        )
+        settings.scan_warnings = "; ".join(warnings)
+        settings.status = settings.scan_summary
         self.report({"INFO"}, settings.status)
         return {"FINISHED"}
 
@@ -204,6 +337,26 @@ class PMXPHYSICS_OT_start(bpy.types.Operator):
             return {"CANCELLED"}
         settings.is_running = True
         settings.status = iface_("Running")
+        return {"FINISHED"}
+
+
+class PMXPHYSICS_OT_start_all(bpy.types.Operator):
+    bl_idname = "pmx_physics.start_all"
+    bl_label = "Start All"
+    bl_description = "Start PMX physics for all enabled models in the model list"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        try:
+            count = physics_sync.start_all(context, settings)
+        except Exception as exc:
+            settings.is_running = False
+            settings.status = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        settings.is_running = True
+        settings.status = f"{iface_('Running')} {count} {iface_('model(s)')}"
         return {"FINISHED"}
 
 

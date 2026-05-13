@@ -8,7 +8,7 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
     bl_label = "PMX Physics"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "PMX Physics"
+    bl_category = "MMP"
 
     def draw(self, context):
         settings = context.scene.pmx_physics
@@ -19,6 +19,25 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
         col.operator("pmx_physics.use_active_model", icon="ARMATURE_DATA")
         col.operator("pmx_physics.scan_model", icon="VIEWZOOM")
         col.operator("pmx_physics.import_vmd", icon="ANIM")
+
+        box = layout.box()
+        box.label(text="Multi Model")
+        list_col = box.column(align=True)
+        if len(settings.model_roots):
+            for index, item in enumerate(settings.model_roots):
+                row = list_col.row(align=True)
+                row.prop(item, "enabled", text="")
+                row.prop(item, "root", text="")
+                op = row.operator("pmx_physics.remove_model_slot", text="", icon="X")
+                op.index = index
+        else:
+            list_col.label(text="No models in list")
+        box.prop(settings, "multi_model_mode")
+        row = box.row(align=True)
+        row.operator("pmx_physics.add_active_model", icon="ADD")
+        row.operator("pmx_physics.clear_model_slots", icon="TRASH")
+        row = box.row(align=True)
+        row.operator("pmx_physics.scan_all_models", icon="VIEWZOOM")
 
         layout.separator()
 
@@ -100,6 +119,7 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
         row = layout.row(align=True)
         row.enabled = not is_running
         row.operator("pmx_physics.start", icon="PLAY")
+        row.operator("pmx_physics.start_all", icon="PLAY")
         row = layout.row(align=True)
         row.enabled = is_running
         row.operator("pmx_physics.stop", icon="PAUSE")
@@ -130,6 +150,9 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
             col.label(text=f"Bodies {settings.perf_body_count} / Joints {settings.perf_joint_count} / Pairs {settings.perf_pair_count}")
             col.label(text=f"Steps {settings.perf_step_count} / Tick steps {settings.perf_last_tick_steps} / Smooth {settings.perf_last_smoothing_segments} (max {settings.perf_max_smoothing_segments})")
             col.label(text=f"Writes Bones {settings.perf_last_bone_writes} / Objects {settings.perf_last_object_writes}")
+            col.label(text=f"Contact Pairs {settings.perf_last_contact_pairs} / Detect {settings.perf_last_contact_detect_ms:.2f} ms")
+            col.label(text=f"Models Active {settings.perf_last_shared_active_models} / Changed {settings.perf_last_changed_models} / Contact {settings.perf_last_contact_models}")
+            col.label(text=f"Disabled Model Pairs {settings.perf_last_disabled_model_pairs} / Writeback {settings.perf_last_writeback_models}")
             grid = box.grid_flow(columns=4, align=True)
             grid.label(text="")
             grid.label(text="Last")
@@ -147,6 +170,17 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
         box.label(text="Realtime Performance")
         col = box.column(align=True)
         col.prop(settings, "realtime_update_rigid_objects")
+        col.prop(settings, "realtime_follow_root_motion")
+        col.prop(settings, "realtime_drag_compensation")
+        if settings.realtime_drag_compensation:
+            sub = col.column(align=True)
+            sub.prop(settings, "realtime_drag_compensate_static")
+            sub.prop(settings, "realtime_drag_compensate_dynamic_bone")
+            sub.prop(settings, "realtime_drag_max_segments")
+            sub.prop(settings, "realtime_drag_resync")
+            if settings.realtime_drag_resync:
+                sub.prop(settings, "realtime_drag_resync_threshold")
+                sub.prop(settings, "realtime_drag_resync_clear_velocity")
         col.prop(settings, "realtime_skip_unchanged_bones")
         if settings.realtime_skip_unchanged_bones or settings.realtime_update_rigid_objects:
             col.prop(settings, "realtime_write_location_threshold")

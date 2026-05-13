@@ -27,6 +27,14 @@ def _default_apply_options():
         "skip_unchanged_bones": False,
         "write_location_threshold": 0.0,
         "write_rotation_threshold": 0.0,
+        "follow_root_motion": True,
+        "drag_compensation": True,
+        "drag_compensate_static": True,
+        "drag_compensate_dynamic_bone": True,
+        "drag_max_segments": 32,
+        "drag_resync": True,
+        "drag_resync_threshold": 0.5,
+        "drag_resync_clear_velocity": False,
     }
 
 
@@ -36,6 +44,14 @@ def _normalize_apply_options(options):
         normalized.update(options)
     normalized["update_rigid_objects"] = bool(normalized["update_rigid_objects"])
     normalized["skip_unchanged_bones"] = bool(normalized["skip_unchanged_bones"])
+    normalized["follow_root_motion"] = bool(normalized["follow_root_motion"])
+    normalized["drag_compensation"] = bool(normalized["drag_compensation"])
+    normalized["drag_compensate_static"] = bool(normalized["drag_compensate_static"])
+    normalized["drag_compensate_dynamic_bone"] = bool(normalized["drag_compensate_dynamic_bone"])
+    normalized["drag_max_segments"] = max(1, min(96, int(normalized["drag_max_segments"])))
+    normalized["drag_resync"] = bool(normalized["drag_resync"])
+    normalized["drag_resync_threshold"] = max(0.01, float(normalized["drag_resync_threshold"]))
+    normalized["drag_resync_clear_velocity"] = bool(normalized["drag_resync_clear_velocity"])
     normalized["write_location_threshold"] = max(0.0, float(normalized["write_location_threshold"]))
     normalized["write_rotation_threshold"] = math.radians(max(0.0, float(normalized["write_rotation_threshold"])))
     return normalized
@@ -212,6 +228,11 @@ class PhysicsWorld:
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
         self._last_root_world = None
+        self._drag_previous_dynamic_matrices = {}
+        self._drag_current_dynamic_matrices = {}
+        self._drag_dynamic_blended_indices = set()
+        self._drag_resync_pending = False
+        self._drag_resync_indices = set()
         self.performance = _new_performance()
 
     def initialize(
@@ -306,6 +327,11 @@ class PhysicsWorld:
         self._initial_snapshot = None
         self._prewarm_steps = 0
         self._last_kinematic_matrices = {}
+        self._drag_previous_dynamic_matrices = {}
+        self._drag_current_dynamic_matrices = {}
+        self._drag_dynamic_blended_indices = set()
+        self._drag_resync_pending = False
+        self._drag_resync_indices = set()
         self._muted_action_fcurves = []
         self.apply_options = _default_apply_options()
         self._bone_target_entries = []
@@ -440,9 +466,14 @@ class PhysicsWorld:
 
     def step(self, timestep, max_substeps, apply_results=True):
         start_time = time.perf_counter()
-        self._preserve_dynamic_world_space_on_root_motion()
+        if bool(self.apply_options.get("follow_root_motion", True)):
+            if self._last_root_world is None and self.model is not None and self.model.root is not None:
+                self._last_root_world = self.model.root.matrix_world.copy()
+        else:
+            self._preserve_dynamic_world_space_on_root_motion()
         collect_start = start_time
         kinematic_matrices = self._current_body_matrices(include_dynamic=False)
+        self._prepare_drag_dynamic_compensation()
         collect_ms = (time.perf_counter() - collect_start) * 1000.0
         native_start = time.perf_counter()
         self._step_with_kinematic_smoothing(kinematic_matrices, timestep, max_substeps)
@@ -541,6 +572,7 @@ class PhysicsWorld:
             self.performance["last_smoothing_segments"] = 1
             self.native.set_kinematic_transforms(kinematic_matrices)
             self.native.step(timestep, max_substeps)
+            self._apply_drag_dynamic_resync()
             return
 
         segments = self._kinematic_segment_count(kinematic_matrices)
@@ -552,14 +584,16 @@ class PhysicsWorld:
         if segments <= 1:
             self.native.set_kinematic_transforms(kinematic_matrices)
             self.native.step(timestep, max_substeps)
+            self._apply_drag_dynamic_resync()
             return
 
         sub_timestep = timestep / segments
         for segment in range(1, segments + 1):
             factor = segment / segments
-            blended = self._interpolate_kinematic_matrices(kinematic_matrices, factor)
+            blended = self._interpolate_kinematic_matrices(kinematic_matrices, factor, include_static_fallback=True)
             self.native.set_kinematic_transforms(blended)
             self.native.step(sub_timestep, 1)
+        self._apply_drag_dynamic_resync()
 
     def _kinematic_segment_count(self, kinematic_matrices):
         segments = 1
@@ -572,17 +606,122 @@ class PhysicsWorld:
                 segments = max(segments, math.ceil(move / self._kinematic_smoothing_move))
             if angle > self._kinematic_smoothing_angle:
                 segments = max(segments, math.ceil(angle / self._kinematic_smoothing_angle))
-        return max(1, min(self._kinematic_smoothing_steps, segments))
+        if bool(self.apply_options.get("drag_compensation", True)):
+            root_segments = self._root_motion_segment_count()
+            if root_segments > 1:
+                segments = max(segments, root_segments)
+            dynamic_segments = self._dynamic_bone_segment_count()
+            if dynamic_segments > 1:
+                segments = max(segments, dynamic_segments)
+            limit = max(int(self._kinematic_smoothing_steps), int(self.apply_options.get("drag_max_segments", 32)))
+        else:
+            limit = int(self._kinematic_smoothing_steps)
+        return max(1, min(max(1, limit), segments))
 
-    def _interpolate_kinematic_matrices(self, kinematic_matrices, factor):
+    def _root_motion_segment_count(self):
+        if self.model is None or self.model.root is None or self._last_root_world is None:
+            return 1
+        move, angle = self._matrix_delta(self._last_root_world, self.model.root.matrix_world)
+        segments = 1
+        if move > self._kinematic_smoothing_move:
+            segments = max(segments, math.ceil(move / self._kinematic_smoothing_move))
+        if angle > self._kinematic_smoothing_angle:
+            segments = max(segments, math.ceil(angle / self._kinematic_smoothing_angle))
+        return segments
+
+    def _dynamic_bone_segment_count(self):
+        if not bool(self.apply_options.get("drag_compensate_dynamic_bone", True)):
+            return 1
+        segments = 1
+        self._drag_dynamic_blended_indices = set()
+        self._drag_resync_indices = set()
+        for index, current in self._drag_current_dynamic_matrices.items():
+            previous = self._drag_previous_dynamic_matrices.get(index)
+            if previous is None:
+                continue
+            move, angle = self._matrix_delta(previous, current)
+            if move > self._kinematic_smoothing_move:
+                segments = max(segments, math.ceil(move / self._kinematic_smoothing_move))
+            if angle > self._kinematic_smoothing_angle:
+                segments = max(segments, math.ceil(angle / self._kinematic_smoothing_angle))
+            if self._should_extreme_drag_resync(move):
+                self._drag_resync_indices.add(index)
+            self._drag_dynamic_blended_indices.add(index)
+        self._drag_resync_pending = bool(self._drag_resync_indices)
+        return segments
+
+    def _interpolate_kinematic_matrices(self, kinematic_matrices, factor, include_static_fallback=False):
         blended = {}
         for index, matrix in kinematic_matrices.items():
             previous = self._last_kinematic_matrices.get(index)
+            if previous is None:
+                if include_static_fallback:
+                    previous = self._fallback_previous_kinematic_matrix(matrix)
+                else:
+                    previous = None
             if previous is None:
                 blended[index] = matrix
             else:
                 blended[index] = self._interpolate_matrix(previous, matrix, factor)
         return blended
+
+    def _fallback_previous_kinematic_matrix(self, matrix):
+        if not bool(self.apply_options.get("drag_compensate_static", True)):
+            return None
+        if self.model is None or self.model.root is None or self._last_root_world is None:
+            return None
+        current_root = self.model.root.matrix_world
+        move, angle = self._matrix_delta(self._last_root_world, current_root)
+        if move <= 1.0e-6 and angle <= 1.0e-5:
+            return None
+        return current_root.inverted_safe() @ self._last_root_world @ matrix
+
+    def _prepare_drag_dynamic_compensation(self):
+        self._drag_previous_dynamic_matrices = {}
+        self._drag_current_dynamic_matrices = {}
+        self._drag_dynamic_blended_indices = set()
+        self._drag_resync_pending = False
+        self._drag_resync_indices = set()
+        if (
+            not bool(self.apply_options.get("drag_compensation", True))
+            or self.native is None
+            or self.model is None
+            or not bool(self.apply_options.get("drag_compensate_dynamic_bone", True))
+        ):
+            return
+
+        body_matrices = self.native.get_body_transforms(len(self.model.rigid_bodies))
+        for rigid in self.model.rigid_bodies:
+            if rigid.mode != MODE_DYNAMIC_BONE:
+                continue
+            previous = body_matrices.get(rigid.index)
+            if previous is None:
+                continue
+            current = self._current_body_matrix(rigid)
+            self._drag_previous_dynamic_matrices[rigid.index] = previous
+            self._drag_current_dynamic_matrices[rigid.index] = current
+
+    def _apply_drag_dynamic_resync(self):
+        if self.native is None or not self._drag_resync_pending:
+            return
+
+        transforms = {
+            index: self._drag_current_dynamic_matrices[index]
+            for index in self._drag_resync_indices
+            if index in self._drag_current_dynamic_matrices
+        }
+        if transforms:
+            if bool(self.apply_options.get("drag_resync_clear_velocity", False)):
+                self.native.freeze_body_transforms(transforms)
+            else:
+                self.native.temporal_kinematic_init(transforms)
+        self._drag_resync_pending = False
+
+    def _should_extreme_drag_resync(self, move):
+        return (
+            bool(self.apply_options.get("drag_resync", True))
+            and move >= float(self.apply_options.get("drag_resync_threshold", 0.5))
+        )
 
     @staticmethod
     def _copy_matrices(matrices):

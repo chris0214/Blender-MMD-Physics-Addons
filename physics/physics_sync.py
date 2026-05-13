@@ -3,10 +3,14 @@ import time
 import bpy
 
 from .physics_world import PhysicsWorld, capture_initial_snapshot, restore_last_initial_snapshot
+from .hybrid_physics_world import HybridPhysicsWorld
+from .shared_physics_world import SharedPhysicsWorld
+from .shadow_physics_world import ShadowPhysicsWorld
 
 
 _controller = None
 _REGISTRY_KEY = "pmx_physics.controllers"
+_RIGIDBODY_DISABLE_KEY = "pmx_physics.rigidbody_disable_state"
 
 
 def _controller_registry():
@@ -31,6 +35,14 @@ def _known_controllers():
     return controllers
 
 
+def _is_animation_playing():
+    try:
+        screen = bpy.context.screen
+    except Exception:
+        screen = None
+    return bool(getattr(screen, "is_animation_playing", False))
+
+
 def _register_controller(controller):
     registry = _controller_registry()
     if all(item is not controller for item in registry):
@@ -52,18 +64,57 @@ def _clear_current_controller(controller):
         _controller = None
 
 
+def _active_model_roots(settings):
+    roots = []
+    seen = set()
+    for item in getattr(settings, "model_roots", []):
+        root = getattr(item, "root", None)
+        if root is None or not bool(getattr(item, "enabled", True)):
+            continue
+        key = root.name
+        if key in seen:
+            continue
+        roots.append(root)
+        seen.add(key)
+    return roots
+
+
 def _disable_blender_rigidbody_world(scene):
     rigidbody_world = getattr(scene, "rigidbody_world", None)
     if rigidbody_world is None:
         return None, None
-    previous_enabled = bool(rigidbody_world.enabled)
+    namespace = bpy.app.driver_namespace
+    state = namespace.get(_RIGIDBODY_DISABLE_KEY)
+    if not isinstance(state, dict) or state.get("world_id") != id(rigidbody_world):
+        state = {
+            "world_id": id(rigidbody_world),
+            "previous_enabled": bool(rigidbody_world.enabled),
+            "count": 0,
+        }
+    state["count"] = int(state.get("count", 0)) + 1
+    namespace[_RIGIDBODY_DISABLE_KEY] = state
     rigidbody_world.enabled = False
-    return rigidbody_world, previous_enabled
+    return rigidbody_world, state.get("previous_enabled")
 
 
 def _restore_blender_rigidbody_world(rigidbody_world, previous_enabled):
-    if rigidbody_world is not None and previous_enabled is not None:
-        rigidbody_world.enabled = previous_enabled
+    if rigidbody_world is None:
+        return
+    namespace = bpy.app.driver_namespace
+    state = namespace.get(_RIGIDBODY_DISABLE_KEY)
+    if not isinstance(state, dict) or state.get("world_id") != id(rigidbody_world):
+        if previous_enabled is not None:
+            rigidbody_world.enabled = previous_enabled
+        return
+
+    count = max(0, int(state.get("count", 0)) - 1)
+    if count > 0:
+        state["count"] = count
+        namespace[_RIGIDBODY_DISABLE_KEY] = state
+        return
+
+    rigidbody_world.enabled = bool(state.get("previous_enabled", previous_enabled))
+    namespace.pop(_RIGIDBODY_DISABLE_KEY, None)
 
 
 def is_active():
@@ -125,6 +176,75 @@ def _publish_performance(settings, world):
     settings.perf_max_smoothing_segments = int(perf.get("max_smoothing_segments", 1))
     settings.perf_last_bone_writes = int(perf.get("last_bone_writes", 0))
     settings.perf_last_object_writes = int(perf.get("last_object_writes", 0))
+    settings.perf_last_contact_pairs = int(perf.get("last_contact_pairs", 0))
+    settings.perf_last_shared_active_models = int(perf.get("last_shared_active_models", 0))
+    settings.perf_last_changed_models = int(perf.get("last_changed_models", 0))
+    settings.perf_last_contact_models = int(perf.get("last_contact_models", 0))
+    settings.perf_last_disabled_model_pairs = int(perf.get("last_disabled_model_pairs", 0))
+    settings.perf_last_writeback_models = int(perf.get("last_writeback_models", 0))
+    settings.perf_last_contact_detect_ms = float(perf.get("last_contact_detect_ms", 0.0))
+
+
+def _publish_all_performance(settings):
+    if not bool(getattr(settings, "show_performance_stats", False)):
+        return
+    controllers = [controller for controller in _known_controllers() if bool(getattr(controller, "running", False))]
+    if len(controllers) <= 1:
+        if controllers:
+            _publish_performance(settings, controllers[0].world)
+        return
+
+    perfs = []
+    for controller in controllers:
+        perf = getattr(getattr(controller, "world", None), "performance", None)
+        if isinstance(perf, dict):
+            perfs.append(perf)
+    if not perfs:
+        return
+
+    def total(key):
+        return sum(float(perf.get(key, 0.0)) for perf in perfs)
+
+    def maximum(key):
+        return max(float(perf.get(key, 0.0)) for perf in perfs)
+
+    settings.perf_body_count = sum(int(perf.get("body_count", 0)) for perf in perfs)
+    settings.perf_joint_count = sum(int(perf.get("joint_count", 0)) for perf in perfs)
+    settings.perf_pair_count = sum(int(perf.get("pair_count", 0)) for perf in perfs)
+    settings.perf_last_step_ms = total("last_step_ms")
+    settings.perf_avg_step_ms = total("avg_step_ms")
+    settings.perf_max_step_ms = total("max_step_ms")
+    settings.perf_step_count = sum(int(perf.get("step_count", 0)) for perf in perfs)
+    settings.perf_last_tick_ms = total("last_tick_ms")
+    settings.perf_avg_tick_ms = total("avg_tick_ms")
+    settings.perf_max_tick_ms = total("max_tick_ms")
+    settings.perf_last_flush_ms = total("last_flush_ms")
+    settings.perf_avg_flush_ms = total("avg_flush_ms")
+    settings.perf_max_flush_ms = total("max_flush_ms")
+    settings.perf_last_collect_ms = total("last_collect_ms")
+    settings.perf_avg_collect_ms = total("avg_collect_ms")
+    settings.perf_max_collect_ms = total("max_collect_ms")
+    settings.perf_last_native_ms = total("last_native_ms")
+    settings.perf_avg_native_ms = total("avg_native_ms")
+    settings.perf_max_native_ms = total("max_native_ms")
+    settings.perf_last_readback_ms = total("last_readback_ms")
+    settings.perf_avg_readback_ms = total("avg_readback_ms")
+    settings.perf_max_readback_ms = total("max_readback_ms")
+    settings.perf_last_apply_ms = total("last_apply_ms")
+    settings.perf_avg_apply_ms = total("avg_apply_ms")
+    settings.perf_max_apply_ms = total("max_apply_ms")
+    settings.perf_last_tick_steps = sum(int(perf.get("last_tick_steps", 0)) for perf in perfs)
+    settings.perf_last_smoothing_segments = int(maximum("last_smoothing_segments"))
+    settings.perf_max_smoothing_segments = int(maximum("max_smoothing_segments"))
+    settings.perf_last_bone_writes = sum(int(perf.get("last_bone_writes", 0)) for perf in perfs)
+    settings.perf_last_object_writes = sum(int(perf.get("last_object_writes", 0)) for perf in perfs)
+    settings.perf_last_contact_pairs = sum(int(perf.get("last_contact_pairs", 0)) for perf in perfs)
+    settings.perf_last_shared_active_models = sum(int(perf.get("last_shared_active_models", 0)) for perf in perfs)
+    settings.perf_last_changed_models = sum(int(perf.get("last_changed_models", 0)) for perf in perfs)
+    settings.perf_last_contact_models = sum(int(perf.get("last_contact_models", 0)) for perf in perfs)
+    settings.perf_last_disabled_model_pairs = sum(int(perf.get("last_disabled_model_pairs", 0)) for perf in perfs)
+    settings.perf_last_writeback_models = sum(int(perf.get("last_writeback_models", 0)) for perf in perfs)
+    settings.perf_last_contact_detect_ms = total("last_contact_detect_ms")
 
 
 def _scene_fps(scene):
@@ -152,6 +272,14 @@ def _realtime_apply_options(settings):
         "skip_unchanged_bones": bool(getattr(settings, "realtime_skip_unchanged_bones", True)),
         "write_location_threshold": max(0.0, float(getattr(settings, "realtime_write_location_threshold", 0.00015))),
         "write_rotation_threshold": max(0.0, float(getattr(settings, "realtime_write_rotation_threshold", 0.02))),
+        "follow_root_motion": bool(getattr(settings, "realtime_follow_root_motion", True)),
+        "drag_compensation": bool(getattr(settings, "realtime_drag_compensation", True)),
+        "drag_compensate_static": bool(getattr(settings, "realtime_drag_compensate_static", True)),
+        "drag_compensate_dynamic_bone": bool(getattr(settings, "realtime_drag_compensate_dynamic_bone", True)),
+        "drag_max_segments": max(1, int(getattr(settings, "realtime_drag_max_segments", 32))),
+        "drag_resync": bool(getattr(settings, "realtime_drag_resync", True)),
+        "drag_resync_threshold": max(0.01, float(getattr(settings, "realtime_drag_resync_threshold", 0.5))),
+        "drag_resync_clear_velocity": bool(getattr(settings, "realtime_drag_resync_clear_velocity", False)),
     }
 
 
@@ -161,6 +289,14 @@ def _full_apply_options():
         "skip_unchanged_bones": False,
         "write_location_threshold": 0.0,
         "write_rotation_threshold": 0.0,
+        "follow_root_motion": True,
+        "drag_compensation": True,
+        "drag_compensate_static": True,
+        "drag_compensate_dynamic_bone": True,
+        "drag_max_segments": 32,
+        "drag_resync": True,
+        "drag_resync_threshold": 0.5,
+        "drag_resync_clear_velocity": False,
     }
 
 
@@ -227,9 +363,7 @@ def _initialize_timeline_world(context, settings, world, root):
     _publish_performance(settings, world)
 
 
-def _has_armature_action(world):
-    model = getattr(world, "model", None)
-    armature = getattr(model, "armature", None)
+def _armature_has_action(armature):
     if armature is None:
         return False
     animation_data = getattr(armature, "animation_data", None)
@@ -238,6 +372,15 @@ def _has_armature_action(world):
     if animation_data.action is not None:
         return True
     return any(not track.mute and any(strip.action is not None for strip in track.strips) for track in animation_data.nla_tracks)
+
+
+def _has_armature_action(world):
+    models = getattr(world, "models", None)
+    if models:
+        return any(_armature_has_action(getattr(model, "armature", None)) for model in models)
+
+    model = getattr(world, "model", None)
+    return _armature_has_action(getattr(model, "armature", None))
 
 
 def _initialize_world(context, settings, world, root, startup_sync=True, apply_options=None):
@@ -280,6 +423,7 @@ class TimerController:
         self.last_frame = int(scene.frame_current)
         self.has_armature_action = _has_armature_action(world)
         self._internal_frame_set = False
+        self._was_animation_playing = _is_animation_playing()
         self.rigidbody_world, self.previous_rigidbody_enabled = _disable_blender_rigidbody_world(scene)
 
     def tick(self):
@@ -294,6 +438,14 @@ class TimerController:
             self.accumulator += elapsed
 
             fixed_step = _fixed_timestep(self.settings)
+            is_animation_playing = _is_animation_playing()
+            if is_animation_playing != self._was_animation_playing:
+                self._was_animation_playing = is_animation_playing
+                self.last_frame = int(self.scene.frame_current)
+                self.accumulator = 0.0
+                self.world.flush_depsgraph()
+                self.world.reset_to_current_pose()
+                return max(0.001, fixed_step * 0.5)
             if self._sync_changed_scene_frame(fixed_step):
                 return max(0.001, fixed_step * 0.5)
 
@@ -321,7 +473,7 @@ class TimerController:
                     flush_ms += (time.perf_counter() - flush_start) * 1000.0
                 self.world.record_flush_time(flush_ms)
                 self.world.record_tick_time((time.perf_counter() - tick_start) * 1000.0, steps)
-                _publish_performance(self.settings, self.world)
+                _publish_all_performance(self.settings)
 
             return max(0.001, fixed_step * 0.5)
         except Exception as exc:
@@ -346,7 +498,9 @@ class TimerController:
 
         frame_delta = frame - self.last_frame
         self.world.flush_depsgraph()
-        if frame_delta <= 0:
+        if _is_animation_playing():
+            self.world.reset_to_current_pose()
+        elif frame_delta <= 0:
             self.world.reset_to_current_pose()
         else:
             if frame_delta > 1:
@@ -360,6 +514,7 @@ class TimerController:
         self.last_frame = frame
         self.accumulator = 0.0
         _publish_performance(self.settings, self.world)
+        _publish_all_performance(self.settings)
         return True
 
     def stop(self, restore_initial=False):
@@ -389,6 +544,7 @@ class TimelineController:
         self.last_frame = int(scene.frame_current)
         self.handler = self.frame_change
         self._internal_frame_set = False
+        self._was_animation_playing = _is_animation_playing()
         self.rigidbody_world, self.previous_rigidbody_enabled = _disable_blender_rigidbody_world(scene)
 
     def frame_change(self, scene, depsgraph=None):
@@ -398,6 +554,14 @@ class TimelineController:
             return
 
         try:
+            is_animation_playing = _is_animation_playing()
+            if is_animation_playing != self._was_animation_playing:
+                self._was_animation_playing = is_animation_playing
+                self.world.flush_depsgraph()
+                self.world.reset_to_current_pose()
+                self.last_frame = int(scene.frame_current)
+                return
+
             frame = int(scene.frame_current)
             if frame == self.last_frame:
                 return
@@ -440,15 +604,21 @@ class TimelineController:
             _clear_current_controller(self)
 
 
-def start(context, settings):
-    global _controller
-    force_stop()
-    world = PhysicsWorld()
-    root = settings.model_root
-    if root is None:
-        from . import pmx_data_reader
+def _make_controller(context, settings, world):
+    if settings.timeline_mode:
+        controller = TimelineController(world, settings, context.scene)
+        _register_controller(controller)
+        bpy.app.handlers.frame_change_post.append(controller.handler)
+        return controller
 
-        root = pmx_data_reader.find_root_object(context.active_object)
+    controller = TimerController(world, settings, context.scene)
+    _register_controller(controller)
+    bpy.app.timers.register(controller.timer_callback, first_interval=0.0)
+    return controller
+
+
+def _start_root(context, settings, root):
+    world = PhysicsWorld()
     try:
         if settings.timeline_mode:
             _initialize_timeline_world(context, settings, world, root)
@@ -457,14 +627,121 @@ def start(context, settings):
     except Exception:
         world.destroy()
         raise
-    if settings.timeline_mode:
-        _controller = TimelineController(world, settings, context.scene)
-        _register_controller(_controller)
-        bpy.app.handlers.frame_change_post.append(_controller.handler)
-    else:
-        _controller = TimerController(world, settings, context.scene)
-        _register_controller(_controller)
-        bpy.app.timers.register(_controller.timer_callback, first_interval=0.0)
+    return _make_controller(context, settings, world)
+
+
+def _initialize_shared_world(context, settings, world, roots):
+    world.initialize(
+        context,
+        roots,
+        settings.resolved_dll_path(),
+        _effective_gravity(settings),
+        settings.solver_iterations,
+        settings.use_frame_offset,
+        settings.joint_stop_erp,
+        settings.joint_stop_cfm,
+        settings.locked_joint_stop_erp,
+        settings.locked_joint_stop_cfm,
+        settings.prewarm_steps,
+        settings.kinematic_smoothing,
+        settings.kinematic_smoothing_steps,
+        settings.kinematic_smoothing_move,
+        settings.kinematic_smoothing_angle,
+        _startup_sync_steps(settings),
+        settings.locked_joint_pullback,
+        settings.resting_body_stabilization,
+        _realtime_apply_options(settings),
+    )
+    _publish_performance(settings, world)
+
+
+def _start_shared_roots(context, settings, roots):
+    world = SharedPhysicsWorld()
+    try:
+        _initialize_shared_world(context, settings, world, roots)
+    except Exception:
+        world.destroy()
+        raise
+    return _make_controller(context, settings, world)
+
+
+def _start_shadow_roots(context, settings, roots):
+    world = ShadowPhysicsWorld()
+    try:
+        _initialize_shared_world(context, settings, world, roots)
+    except Exception:
+        world.destroy()
+        raise
+    return _make_controller(context, settings, world)
+
+
+def _start_hybrid_roots(context, settings, roots, allow_shared_island=False):
+    world = HybridPhysicsWorld(allow_shared_island=allow_shared_island)
+    try:
+        _initialize_shared_world(context, settings, world, roots)
+    except Exception:
+        world.destroy()
+        raise
+    return _make_controller(context, settings, world)
+
+
+def _start_contact_gate_roots(context, settings, roots):
+    world = SharedPhysicsWorld()
+    world.configure_contact_gate(True)
+    try:
+        _initialize_shared_world(context, settings, world, roots)
+    except Exception:
+        world.destroy()
+        raise
+    return _make_controller(context, settings, world)
+
+
+def start(context, settings):
+    global _controller
+    force_stop()
+    root = settings.model_root
+    if root is None:
+        from . import pmx_data_reader
+
+        root = pmx_data_reader.find_root_object(context.active_object)
+    _controller = _start_root(context, settings, root)
+
+
+def start_all(context, settings):
+    global _controller
+    roots = _active_model_roots(settings)
+    if not roots:
+        from . import pmx_data_reader
+
+        root = settings.model_root or pmx_data_reader.find_root_object(context.active_object)
+        if root is not None:
+            roots = [root]
+    if not roots:
+        raise RuntimeError(bpy.app.translations.pgettext_iface("No mmd_tools model root selected"))
+
+    force_stop()
+    mode = getattr(settings, "multi_model_mode", "INDEPENDENT")
+    if mode in {"ROOT_ISOLATED", "INDEPENDENT"}:
+        _controller = _start_hybrid_roots(context, settings, roots, allow_shared_island=False)
+        return len(roots)
+    if mode == "SHARED_COLLISION":
+        _controller = _start_shadow_roots(context, settings, roots)
+        return len(roots)
+    if mode == "GLOBAL_SHARED":
+        _controller = _start_shared_roots(context, settings, roots)
+        return len(roots)
+
+    started = []
+    try:
+        for root in roots:
+            started.append(_start_root(context, settings, root))
+    except Exception:
+        for controller in started:
+            controller.stop()
+            controller.settings.is_running = False
+        raise
+    _controller = started[0] if started else None
+    return len(started)
 
 
 def stop():

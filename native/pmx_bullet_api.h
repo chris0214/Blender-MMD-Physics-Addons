@@ -74,6 +74,18 @@ struct PmxBtNonCollisionPair
     int rigid_b;
 };
 
+struct PmxBtModelPair
+{
+    int model_a;
+    int model_b;
+};
+
+struct PmxBtBodyPair
+{
+    int body_a;
+    int body_b;
+};
+
 PMX_BULLET_API int pmx_bullet_api_version();
 PMX_BULLET_API void* pmx_bullet_create_world();
 PMX_BULLET_API void pmx_bullet_destroy_world(void* world);
@@ -91,10 +103,15 @@ PMX_BULLET_API int pmx_bullet_set_stabilization(
     int locked_joint_pullback,
     int resting_body_stabilization);
 PMX_BULLET_API int pmx_bullet_add_rigid_bodies(void* world, const PmxBtRigidDesc* bodies, int count);
+PMX_BULLET_API int pmx_bullet_set_body_model_ids(void* world, int start_body, int count, int model_index);
+PMX_BULLET_API int pmx_bullet_set_disabled_model_pairs(void* world, const PmxBtModelPair* pairs, int count);
+PMX_BULLET_API int pmx_bullet_set_cross_model_body_pair_filter_enabled(void* world, int enabled);
+PMX_BULLET_API int pmx_bullet_set_enabled_cross_model_body_pairs(void* world, const PmxBtBodyPair* pairs, int count);
 PMX_BULLET_API int pmx_bullet_add_non_collision_pairs(void* world, const PmxBtNonCollisionPair* pairs, int count);
 PMX_BULLET_API int pmx_bullet_add_joints(void* world, const PmxBtJointDesc* joints, int count);
 PMX_BULLET_API int pmx_bullet_temporal_kinematic_init(void* world, const PmxBtBodyTransform* transforms, int count);
 PMX_BULLET_API int pmx_bullet_set_kinematic_transforms(void* world, const PmxBtBodyTransform* transforms, int count);
+PMX_BULLET_API int pmx_bullet_freeze_body_transforms(void* world, const PmxBtBodyTransform* transforms, int count);
 PMX_BULLET_API int pmx_bullet_step(void* world, float fixed_timestep, int max_substeps);
 PMX_BULLET_API int pmx_bullet_get_body_transforms(void* world, PmxBtBodyTransform* transforms, int count);
 PMX_BULLET_API int pmx_bullet_reset(void* world);

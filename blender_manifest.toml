@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
-id = "pmx_physics"
-version = "1.1.0"
-name = "PMX Physics"
-tagline = "External Bullet 2.82 runtime for mmd_tools PMX rigid bodies"
+id = "miku_miku_physics"
+version = "2.0.0"
+name = "MikuMikuPhysics"
+tagline = "External Bullet 2.82 runtime for mmd_tools PMX physics"
 maintainer = "克里斯提亚娜"
 type = "add-on"
 

@@ -11,7 +11,7 @@
 
 namespace {
 
-constexpr int kApiVersion = 6;
+constexpr int kApiVersion = 9;
 constexpr int kSolverIterations = 20;
 constexpr int kConstraintStopErp = 2;
 constexpr int kConstraintStopCfm = 4;
@@ -55,12 +55,32 @@ bool is_dynamic_mode(int mode)
 
 struct PmxOverlapFilter : public btOverlapFilterCallback {
     std::set<std::pair<const btBroadphaseProxy*, const btBroadphaseProxy*>> ignored_pairs;
+    const std::vector<int>* body_model_ids = nullptr;
+    std::set<std::pair<int, int>> disabled_model_pairs;
+    bool use_cross_model_body_pair_filter = false;
+    std::set<std::pair<int, int>> enabled_cross_model_body_pairs;
 
     bool needBroadphaseCollision(btBroadphaseProxy* proxy0, btBroadphaseProxy* proxy1) const override
     {
         const auto ordered = ordered_pair(proxy0, proxy1);
         if (ignored_pairs.find(ordered) != ignored_pairs.end()) {
             return false;
+        }
+
+        if (body_model_ids != nullptr) {
+            const int body0 = body_index(proxy0);
+            const int body1 = body_index(proxy1);
+            const int model0 = model_index(proxy0);
+            const int model1 = model_index(proxy1);
+            if (model0 >= 0 && model1 >= 0 && model0 != model1) {
+                if (use_cross_model_body_pair_filter &&
+                    enabled_cross_model_body_pairs.find(ordered_index_pair(body0, body1)) == enabled_cross_model_body_pairs.end()) {
+                    return false;
+                }
+                if (disabled_model_pairs.find(ordered_model_pair(model0, model1)) != disabled_model_pairs.end()) {
+                    return false;
+                }
+            }
         }
 
         bool collides = (proxy0->m_collisionFilterGroup & proxy1->m_collisionFilterMask) != 0;
@@ -81,6 +101,43 @@ struct PmxOverlapFilter : public btOverlapFilterCallback {
             std::swap(proxy0, proxy1);
         }
         return std::make_pair(proxy0, proxy1);
+    }
+
+    static std::pair<int, int> ordered_model_pair(int model0, int model1)
+    {
+        if (model1 < model0) {
+            std::swap(model0, model1);
+        }
+        return std::make_pair(model0, model1);
+    }
+
+    static std::pair<int, int> ordered_index_pair(int index0, int index1)
+    {
+        if (index1 < index0) {
+            std::swap(index0, index1);
+        }
+        return std::make_pair(index0, index1);
+    }
+
+    int body_index(const btBroadphaseProxy* proxy) const
+    {
+        if (proxy == nullptr || proxy->m_clientObject == nullptr) {
+            return -1;
+        }
+        const btCollisionObject* object = static_cast<const btCollisionObject*>(proxy->m_clientObject);
+        return object->getUserIndex();
+    }
+
+    int model_index(const btBroadphaseProxy* proxy) const
+    {
+        if (body_model_ids == nullptr) {
+            return -1;
+        }
+        const int body_index = this->body_index(proxy);
+        if (body_index < 0 || body_index >= static_cast<int>(body_model_ids->size())) {
+            return -1;
+        }
+        return (*body_model_ids)[body_index];
     }
 };
 
@@ -111,6 +168,7 @@ struct PmxWorld {
     std::vector<btTransform> last_transforms;
     std::vector<int> resting_frames;
     std::vector<int> body_modes;
+    std::vector<int> body_model_ids;
     PmxOverlapFilter overlap_filter;
     int solver_iterations = kSolverIterations;
     bool use_frame_offset = true;
@@ -135,6 +193,7 @@ struct PmxWorld {
         dynamics_world->setGravity(btVector3(0.0f, -9.8f, 0.0f));
         dynamics_world->getSolverInfo().m_numIterations = solver_iterations;
         dynamics_world->getSolverInfo().m_solverMode |= SOLVER_USE_WARMSTARTING;
+        overlap_filter.body_model_ids = &body_model_ids;
         dynamics_world->getPairCache()->setOverlapFilterCallback(&overlap_filter);
     }
 
@@ -216,14 +275,16 @@ void set_body_transform(btRigidBody& body, const btTransform& transform)
     }
 }
 
-int set_kinematic_transform(PmxWorld& world, const PmxBtBodyTransform& body_transform)
+int set_kinematic_transform(PmxWorld& world, const PmxBtBodyTransform& body_transform, bool activate_body = true)
 {
     if (body_transform.index < 0 || body_transform.index >= static_cast<int>(world.bodies.size())) {
         return 0;
     }
     btRigidBody& body = *world.bodies[body_transform.index];
     set_body_transform(body, to_transform(body_transform.position, body_transform.rotation));
-    body.activate(true);
+    if (activate_body) {
+        body.activate(true);
+    }
     return 1;
 }
 
@@ -244,10 +305,144 @@ void refresh_body_proxy(PmxWorld& world, btRigidBody& body)
     clean_body_pairs(world, body);
 }
 
+void clean_all_body_pairs(PmxWorld& world)
+{
+    for (const auto& body : world.bodies) {
+        if (body && body->getBroadphaseHandle() != nullptr) {
+            clean_body_pairs(world, *body);
+        }
+    }
+}
+
 void refresh_world_pairs(PmxWorld& world)
 {
     world.dynamics_world->updateAabbs();
     world.dynamics_world->computeOverlappingPairs();
+}
+
+int body_model_id(const PmxWorld& world, const btCollisionObject* object)
+{
+    if (object == nullptr) {
+        return -1;
+    }
+    const int body_index = object->getUserIndex();
+    if (body_index < 0 || body_index >= static_cast<int>(world.body_model_ids.size())) {
+        return -1;
+    }
+    return world.body_model_ids[body_index];
+}
+
+bool disabled_model_pair(const PmxWorld& world, const btCollisionObject* object0, const btCollisionObject* object1)
+{
+    const int model0 = body_model_id(world, object0);
+    const int model1 = body_model_id(world, object1);
+    if (model0 < 0 || model1 < 0 || model0 == model1) {
+        return false;
+    }
+    return world.overlap_filter.disabled_model_pairs.find(
+        PmxOverlapFilter::ordered_model_pair(model0, model1)) != world.overlap_filter.disabled_model_pairs.end();
+}
+
+bool disabled_cross_model_body_pair(const PmxWorld& world, int index0, int index1)
+{
+    if (!world.overlap_filter.use_cross_model_body_pair_filter) {
+        return false;
+    }
+    if (index0 < 0 || index1 < 0 ||
+        index0 >= static_cast<int>(world.body_model_ids.size()) ||
+        index1 >= static_cast<int>(world.body_model_ids.size())) {
+        return false;
+    }
+    const int model0 = world.body_model_ids[index0];
+    const int model1 = world.body_model_ids[index1];
+    if (model0 < 0 || model1 < 0 || model0 == model1) {
+        return false;
+    }
+    return world.overlap_filter.enabled_cross_model_body_pairs.find(
+        PmxOverlapFilter::ordered_index_pair(index0, index1)) == world.overlap_filter.enabled_cross_model_body_pairs.end();
+}
+
+bool disabled_cross_model_body_pair(const PmxWorld& world, const btCollisionObject* object0, const btCollisionObject* object1)
+{
+    if (object0 == nullptr || object1 == nullptr) {
+        return false;
+    }
+    return disabled_cross_model_body_pair(world, object0->getUserIndex(), object1->getUserIndex());
+}
+
+int body_index_from_proxy(const btBroadphaseProxy* proxy)
+{
+    if (proxy == nullptr || proxy->m_clientObject == nullptr) {
+        return -1;
+    }
+    const auto* object = static_cast<const btCollisionObject*>(proxy->m_clientObject);
+    return object->getUserIndex();
+}
+
+bool same_model_body_indices(const PmxWorld& world, int index0, int index1)
+{
+    if (index0 < 0 || index1 < 0 ||
+        index0 >= static_cast<int>(world.body_model_ids.size()) ||
+        index1 >= static_cast<int>(world.body_model_ids.size())) {
+        return false;
+    }
+    const int model0 = world.body_model_ids[index0];
+    const int model1 = world.body_model_ids[index1];
+    return model0 >= 0 && model1 >= 0 && model0 == model1;
+}
+
+bool disabled_model_pair_indices(const PmxWorld& world, int index0, int index1)
+{
+    if (disabled_cross_model_body_pair(world, index0, index1)) {
+        return true;
+    }
+    if (index0 < 0 || index1 < 0 ||
+        index0 >= static_cast<int>(world.body_model_ids.size()) ||
+        index1 >= static_cast<int>(world.body_model_ids.size())) {
+        return false;
+    }
+    const int model0 = world.body_model_ids[index0];
+    const int model1 = world.body_model_ids[index1];
+    if (model0 < 0 || model1 < 0 || model0 == model1) {
+        return false;
+    }
+    return world.overlap_filter.disabled_model_pairs.find(
+        PmxOverlapFilter::ordered_model_pair(model0, model1)) != world.overlap_filter.disabled_model_pairs.end();
+}
+
+void remove_disabled_model_pairs(PmxWorld& world)
+{
+    btOverlappingPairCache* cache = world.dynamics_world->getPairCache();
+    if (cache == nullptr) {
+        return;
+    }
+
+    btBroadphasePairArray& pairs = cache->getOverlappingPairArray();
+    for (int i = pairs.size() - 1; i >= 0; --i) {
+        btBroadphasePair& pair = pairs[i];
+        const int index_a = body_index_from_proxy(pair.m_pProxy0);
+        const int index_b = body_index_from_proxy(pair.m_pProxy1);
+        if (!disabled_model_pair_indices(world, index_a, index_b)) {
+            continue;
+        }
+        cache->removeOverlappingPair(pair.m_pProxy0, pair.m_pProxy1, world.dispatcher.get());
+    }
+}
+
+void clear_disabled_model_manifolds(PmxWorld& world)
+{
+    const int count = world.dispatcher->getNumManifolds();
+    for (int i = 0; i < count; ++i) {
+        btPersistentManifold* manifold = world.dispatcher->getManifoldByIndexInternal(i);
+        if (manifold == nullptr) {
+            continue;
+        }
+        const btCollisionObject* object0 = static_cast<const btCollisionObject*>(manifold->getBody0());
+        const btCollisionObject* object1 = static_cast<const btCollisionObject*>(manifold->getBody1());
+        if (disabled_model_pair(world, object0, object1) || disabled_cross_model_body_pair(world, object0, object1)) {
+            manifold->clearManifold();
+        }
+    }
 }
 
 bool is_locked_translation_joint(const PmxBtJointDesc& desc)
@@ -288,15 +483,116 @@ void reset_rest_state(PmxWorld& world, int index, const btTransform& transform)
     world.resting_frames[index] = 0;
 }
 
+bool valid_body_index(const PmxWorld& world, int index)
+{
+    return index >= 0 && index < static_cast<int>(world.bodies.size());
+}
+
+bool is_dynamic_body(const PmxWorld& world, int index)
+{
+    return valid_body_index(world, index) && is_dynamic_mode(world.body_modes[index]);
+}
+
+void wake_dynamic_body(PmxWorld& world, int index)
+{
+    if (!is_dynamic_body(world, index)) {
+        return;
+    }
+    btRigidBody& body = *world.bodies[index];
+    body.forceActivationState(ACTIVE_TAG);
+    body.activate(true);
+    reset_rest_state(world, index, body.getWorldTransform());
+}
+
 void wake_dynamic_bodies(PmxWorld& world)
 {
     for (size_t i = 0; i < world.bodies.size(); ++i) {
-        if (!is_dynamic_mode(world.body_modes[i])) {
+        wake_dynamic_body(world, static_cast<int>(i));
+    }
+}
+
+void collect_joint_connected_dynamics(PmxWorld& world, const std::vector<int>& seeds, std::set<int>& wake_indices)
+{
+    std::set<int> visited;
+    std::vector<int> queue;
+    for (int seed : seeds) {
+        if (!valid_body_index(world, seed)) {
             continue;
         }
-        world.bodies[i]->forceActivationState(ACTIVE_TAG);
-        world.bodies[i]->activate(true);
-        reset_rest_state(world, static_cast<int>(i), world.bodies[i]->getWorldTransform());
+        if (visited.insert(seed).second) {
+            queue.push_back(seed);
+        }
+    }
+
+    for (size_t cursor = 0; cursor < queue.size(); ++cursor) {
+        const int current = queue[cursor];
+        for (const PmxJointRuntime& runtime : world.joint_runtimes) {
+            int other = -1;
+            if (runtime.rigid_a == current) {
+                other = runtime.rigid_b;
+            }
+            else if (runtime.rigid_b == current) {
+                other = runtime.rigid_a;
+            }
+            if (!valid_body_index(world, other)) {
+                continue;
+            }
+            if (is_dynamic_body(world, other)) {
+                wake_indices.insert(other);
+            }
+            if (visited.insert(other).second) {
+                queue.push_back(other);
+            }
+        }
+    }
+}
+
+void collect_overlapping_dynamics(
+    PmxWorld& world,
+    const std::set<int>& changed_kinematic_indices,
+    std::set<int>& wake_indices)
+{
+    btBroadphasePairArray& pairs = world.dynamics_world->getPairCache()->getOverlappingPairArray();
+    for (int i = 0; i < pairs.size(); ++i) {
+        const btBroadphasePair& pair = pairs[i];
+        const int index_a = body_index_from_proxy(pair.m_pProxy0);
+        const int index_b = body_index_from_proxy(pair.m_pProxy1);
+        if (disabled_model_pair_indices(world, index_a, index_b)) {
+            continue;
+        }
+        if (!same_model_body_indices(world, index_a, index_b)) {
+            continue;
+        }
+        if (changed_kinematic_indices.find(index_a) != changed_kinematic_indices.end() &&
+            is_dynamic_body(world, index_b)) {
+            wake_indices.insert(index_b);
+        }
+        if (changed_kinematic_indices.find(index_b) != changed_kinematic_indices.end() &&
+            is_dynamic_body(world, index_a)) {
+            wake_indices.insert(index_a);
+        }
+    }
+}
+
+void wake_related_dynamic_bodies(PmxWorld& world, const std::vector<int>& changed_kinematic_indices)
+{
+    if (changed_kinematic_indices.empty()) {
+        return;
+    }
+
+    std::set<int> wake_indices;
+    collect_joint_connected_dynamics(world, changed_kinematic_indices, wake_indices);
+
+    const std::set<int> changed_set(changed_kinematic_indices.begin(), changed_kinematic_indices.end());
+    collect_overlapping_dynamics(world, changed_set, wake_indices);
+
+    if (!wake_indices.empty()) {
+        const std::vector<int> dynamic_seeds(wake_indices.begin(), wake_indices.end());
+        collect_joint_connected_dynamics(world, dynamic_seeds, wake_indices);
+    }
+
+    for (int index : wake_indices) {
+        wake_dynamic_body(world, index);
     }
 }
 
@@ -514,13 +810,109 @@ int pmx_bullet_add_rigid_bodies(void* world_ptr, const PmxBtRigidDesc* bodies, i
         }
 
         world.dynamics_world->addRigidBody(body.get(), desc.collision_group, desc.collision_mask);
+        body->setUserIndex(static_cast<int>(world.bodies.size()));
         world.initial_transforms.push_back(transform);
         world.last_transforms.push_back(transform);
         world.resting_frames.push_back(0);
         world.body_modes.push_back(desc.mode);
+        world.body_model_ids.push_back(-1);
         world.motion_states.push_back(std::move(motion_state));
         world.bodies.push_back(std::move(body));
     }
+    return 1;
+}
+
+int pmx_bullet_set_body_model_ids(void* world_ptr, int start_body, int count, int model_index)
+{
+    if (!world_ptr || start_body < 0 || count < 0 || model_index < 0) {
+        return 0;
+    }
+
+    PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    if (start_body + count > static_cast<int>(world.body_model_ids.size())) {
+        return 0;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        world.body_model_ids[start_body + i] = model_index;
+    }
+    refresh_world_pairs(world);
+    return 1;
+}
+
+int pmx_bullet_set_disabled_model_pairs(void* world_ptr, const PmxBtModelPair* pairs, int count)
+{
+    if (!world_ptr || count < 0 || (count > 0 && !pairs)) {
+        return 0;
+    }
+
+    PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    world.overlap_filter.disabled_model_pairs.clear();
+    for (int i = 0; i < count; ++i) {
+        const int model_a = pairs[i].model_a;
+        const int model_b = pairs[i].model_b;
+        if (model_a < 0 || model_b < 0 || model_a == model_b) {
+            return 0;
+        }
+        world.overlap_filter.disabled_model_pairs.insert(
+            PmxOverlapFilter::ordered_model_pair(model_a, model_b));
+    }
+    clean_all_body_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
+    refresh_world_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
+    return 1;
+}
+
+int pmx_bullet_set_cross_model_body_pair_filter_enabled(void* world_ptr, int enabled)
+{
+    if (!world_ptr) {
+        return 0;
+    }
+
+    PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    world.overlap_filter.use_cross_model_body_pair_filter = enabled != 0;
+    clean_all_body_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
+    refresh_world_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
+    return 1;
+}
+
+int pmx_bullet_set_enabled_cross_model_body_pairs(void* world_ptr, const PmxBtBodyPair* pairs, int count)
+{
+    if (!world_ptr || count < 0 || (count > 0 && !pairs)) {
+        return 0;
+    }
+
+    PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    world.overlap_filter.enabled_cross_model_body_pairs.clear();
+    for (int i = 0; i < count; ++i) {
+        const int body_a = pairs[i].body_a;
+        const int body_b = pairs[i].body_b;
+        if (body_a < 0 || body_b < 0 || body_a == body_b ||
+            body_a >= static_cast<int>(world.body_model_ids.size()) ||
+            body_b >= static_cast<int>(world.body_model_ids.size())) {
+            return 0;
+        }
+        const int model_a = world.body_model_ids[body_a];
+        const int model_b = world.body_model_ids[body_b];
+        if (model_a < 0 || model_b < 0 || model_a == model_b) {
+            continue;
+        }
+        world.overlap_filter.enabled_cross_model_body_pairs.insert(
+            PmxOverlapFilter::ordered_index_pair(body_a, body_b));
+    }
+    clean_all_body_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
+    refresh_world_pairs(world);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
     return 1;
 }
 
@@ -656,27 +1048,58 @@ int pmx_bullet_set_kinematic_transforms(void* world_ptr, const PmxBtBodyTransfor
     }
 
     PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
-    bool kinematic_changed = false;
+    std::vector<int> changed_kinematic_indices;
     for (int i = 0; i < count; ++i) {
+        bool changed = true;
         const int body_index = transforms[i].index;
         if (body_index >= 0 && body_index < static_cast<int>(world.bodies.size()) &&
             !is_dynamic_mode(world.body_modes[body_index])) {
             const btTransform next = to_transform(transforms[i].position, transforms[i].rotation);
-            if (transform_changed(
-                    next,
-                    world.bodies[body_index]->getWorldTransform(),
-                    kKinematicWakeMove2,
-                    kKinematicWakeAngle2)) {
-                kinematic_changed = true;
+            changed = transform_changed(
+                next,
+                world.bodies[body_index]->getWorldTransform(),
+                kKinematicWakeMove2,
+                kKinematicWakeAngle2);
+            if (changed) {
+                changed_kinematic_indices.push_back(body_index);
             }
         }
-        if (!set_kinematic_transform(world, transforms[i])) {
+        if (!set_kinematic_transform(world, transforms[i], changed)) {
             return 0;
         }
     }
-    if (kinematic_changed) {
-        wake_dynamic_bodies(world);
+    if (!changed_kinematic_indices.empty()) {
+        refresh_world_pairs(world);
+        wake_related_dynamic_bodies(world, changed_kinematic_indices);
     }
+    return 1;
+}
+
+int pmx_bullet_freeze_body_transforms(void* world_ptr, const PmxBtBodyTransform* transforms, int count)
+{
+    if (!world_ptr || !transforms || count < 0) {
+        return 0;
+    }
+
+    PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    for (int i = 0; i < count; ++i) {
+        const int body_index = transforms[i].index;
+        if (!valid_body_index(world, body_index)) {
+            return 0;
+        }
+        btRigidBody& body = *world.bodies[body_index];
+        const btTransform transform = to_transform(transforms[i].position, transforms[i].rotation);
+        set_body_transform(body, transform);
+        body.clearForces();
+        body.setLinearVelocity(btVector3(0.0f, 0.0f, 0.0f));
+        body.setAngularVelocity(btVector3(0.0f, 0.0f, 0.0f));
+        refresh_body_proxy(world, body);
+        reset_rest_state(world, body_index, transform);
+        if (is_dynamic_mode(world.body_modes[body_index])) {
+            body.forceActivationState(ISLAND_SLEEPING);
+        }
+    }
+    refresh_world_pairs(world);
     return 1;
 }
 
@@ -687,10 +1110,16 @@ int pmx_bullet_step(void* world_ptr, float fixed_timestep, int max_substeps)
     }
 
     PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
     world.dynamics_world->stepSimulation(fixed_timestep, max_substeps, fixed_timestep);
+    remove_disabled_model_pairs(world);
+    clear_disabled_model_manifolds(world);
     if (world.use_locked_joint_pullback) {
         pullback_locked_joints(world);
         refresh_world_pairs(world);
+        remove_disabled_model_pairs(world);
+        clear_disabled_model_manifolds(world);
     }
     if (world.use_resting_body_stabilization) {
         stabilize_resting_bodies(world);
@@ -734,11 +1163,9 @@ int pmx_bullet_get_body_transforms(void* world_ptr, PmxBtBodyTransform* transfor
 
     PmxWorld& world = *static_cast<PmxWorld*>(world_ptr);
     const int body_count = static_cast<int>(world.bodies.size());
-    if (count < body_count) {
-        return 0;
-    }
+    const int write_count = btMin(count, body_count);
 
-    for (int i = 0; i < body_count; ++i) {
+    for (int i = 0; i < write_count; ++i) {
         btTransform transform;
         world.bodies[i]->getMotionState()->getWorldTransform(transform);
         const btVector3 origin = transform.getOrigin();

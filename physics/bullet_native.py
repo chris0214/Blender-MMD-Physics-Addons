@@ -7,7 +7,7 @@ from mathutils import Quaternion, Vector
 from . import transforms
 
 
-EXPECTED_API_VERSION = 6
+EXPECTED_API_VERSION = 9
 
 
 class NativeError(RuntimeError):
@@ -67,6 +67,20 @@ class NativeNonCollisionPair(ctypes.Structure):
     _fields_ = [
         ("rigid_a", ctypes.c_int),
         ("rigid_b", ctypes.c_int),
+    ]
+
+
+class NativeModelPair(ctypes.Structure):
+    _fields_ = [
+        ("model_a", ctypes.c_int),
+        ("model_b", ctypes.c_int),
+    ]
+
+
+class NativeBodyPair(ctypes.Structure):
+    _fields_ = [
+        ("body_a", ctypes.c_int),
+        ("body_b", ctypes.c_int),
     ]
 
 
@@ -139,6 +153,14 @@ class BulletNative:
         lib.pmx_bullet_set_stabilization.restype = ctypes.c_int
         lib.pmx_bullet_add_rigid_bodies.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeRigidDesc), ctypes.c_int]
         lib.pmx_bullet_add_rigid_bodies.restype = ctypes.c_int
+        lib.pmx_bullet_set_body_model_ids.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        lib.pmx_bullet_set_body_model_ids.restype = ctypes.c_int
+        lib.pmx_bullet_set_disabled_model_pairs.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeModelPair), ctypes.c_int]
+        lib.pmx_bullet_set_disabled_model_pairs.restype = ctypes.c_int
+        lib.pmx_bullet_set_cross_model_body_pair_filter_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.pmx_bullet_set_cross_model_body_pair_filter_enabled.restype = ctypes.c_int
+        lib.pmx_bullet_set_enabled_cross_model_body_pairs.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeBodyPair), ctypes.c_int]
+        lib.pmx_bullet_set_enabled_cross_model_body_pairs.restype = ctypes.c_int
         lib.pmx_bullet_add_non_collision_pairs.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeNonCollisionPair), ctypes.c_int]
         lib.pmx_bullet_add_non_collision_pairs.restype = ctypes.c_int
         lib.pmx_bullet_add_joints.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeJointDesc), ctypes.c_int]
@@ -147,6 +169,8 @@ class BulletNative:
         lib.pmx_bullet_temporal_kinematic_init.restype = ctypes.c_int
         lib.pmx_bullet_set_kinematic_transforms.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeBodyTransform), ctypes.c_int]
         lib.pmx_bullet_set_kinematic_transforms.restype = ctypes.c_int
+        lib.pmx_bullet_freeze_body_transforms.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeBodyTransform), ctypes.c_int]
+        lib.pmx_bullet_freeze_body_transforms.restype = ctypes.c_int
         lib.pmx_bullet_step.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_int]
         lib.pmx_bullet_step.restype = ctypes.c_int
         lib.pmx_bullet_get_body_transforms.argtypes = [ctypes.c_void_p, ctypes.POINTER(NativeBodyTransform), ctypes.c_int]
@@ -219,8 +243,8 @@ class BulletNative:
         initial_matrices = initial_matrices or {}
         array_type = NativeRigidDesc * len(model.rigid_bodies)
         array = array_type()
-        for rigid in model.rigid_bodies:
-            desc = array[rigid.index]
+        for array_index, rigid in enumerate(model.rigid_bodies):
+            desc = array[array_index]
             desc.index = rigid.index
             desc.shape = rigid.shape
             desc.mode = rigid.mode
@@ -237,6 +261,62 @@ class BulletNative:
             _fill3(desc.position, position)
             _fill4(desc.rotation, (rotation.x, rotation.y, rotation.z, rotation.w))
         self._check(self.lib.pmx_bullet_add_rigid_bodies(self.handle, array, len(array)), "add_rigid_bodies")
+
+    def set_body_model_ids(self, start_body, count, model_index):
+        self._check(
+            self.lib.pmx_bullet_set_body_model_ids(
+                self.handle,
+                int(start_body),
+                int(count),
+                int(model_index),
+            ),
+            "set_body_model_ids",
+        )
+
+    def set_disabled_model_pairs(self, pairs):
+        pairs = list(pairs or [])
+        if not pairs:
+            self._check(
+                self.lib.pmx_bullet_set_disabled_model_pairs(self.handle, None, 0),
+                "set_disabled_model_pairs",
+            )
+            return
+        array_type = NativeModelPair * len(pairs)
+        array = array_type()
+        for index, (model_a, model_b) in enumerate(pairs):
+            array[index].model_a = int(model_a)
+            array[index].model_b = int(model_b)
+        self._check(
+            self.lib.pmx_bullet_set_disabled_model_pairs(self.handle, array, len(array)),
+            "set_disabled_model_pairs",
+        )
+
+    def set_cross_model_body_pair_filter_enabled(self, enabled):
+        self._check(
+            self.lib.pmx_bullet_set_cross_model_body_pair_filter_enabled(
+                self.handle,
+                1 if enabled else 0,
+            ),
+            "set_cross_model_body_pair_filter_enabled",
+        )
+
+    def set_enabled_cross_model_body_pairs(self, pairs):
+        pairs = list(pairs or [])
+        if not pairs:
+            self._check(
+                self.lib.pmx_bullet_set_enabled_cross_model_body_pairs(self.handle, None, 0),
+                "set_enabled_cross_model_body_pairs",
+            )
+            return
+        array_type = NativeBodyPair * len(pairs)
+        array = array_type()
+        for index, (body_a, body_b) in enumerate(pairs):
+            array[index].body_a = int(body_a)
+            array[index].body_b = int(body_b)
+        self._check(
+            self.lib.pmx_bullet_set_enabled_cross_model_body_pairs(self.handle, array, len(array)),
+            "set_enabled_cross_model_body_pairs",
+        )
 
     def add_non_collision_pairs(self, model):
         pairs = model.non_collision_pairs
@@ -255,8 +335,8 @@ class BulletNative:
     def add_joints(self, model):
         array_type = NativeJointDesc * len(model.joints)
         array = array_type()
-        for joint in model.joints:
-            desc = array[joint.index]
+        for array_index, joint in enumerate(model.joints):
+            desc = array[array_index]
             desc.index = joint.index
             desc.rigid_a = joint.rigid_a_index
             desc.rigid_b = joint.rigid_b_index
@@ -292,6 +372,15 @@ class BulletNative:
         self._check(
             self.lib.pmx_bullet_set_kinematic_transforms(self.handle, array, len(array)),
             "set_kinematic_transforms",
+        )
+
+    def freeze_body_transforms(self, transforms_by_index):
+        if not transforms_by_index:
+            return
+        array = self._build_transform_array(transforms_by_index)
+        self._check(
+            self.lib.pmx_bullet_freeze_body_transforms(self.handle, array, len(array)),
+            "freeze_body_transforms",
         )
 
     def _build_transform_array(self, transforms_by_index):
