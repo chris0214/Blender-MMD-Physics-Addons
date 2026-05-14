@@ -2,7 +2,7 @@
 
 > **本插件使用 GPT-5.5 辅助编写、调试与文档整理。**
 
-MikuMikuPhysics 是一个 Blender 4.2+ 插件，用于直接模拟由 mmd_tools 导入的 PMX/MMD 模型刚体物理。插件通过外部 `pmx_bullet.dll` 使用 Bullet 2.82 r2704，不依赖 Blender 内置 Bullet，目标是尽量接近 MMD 与 PMXEditor TransformView 的物理行为。
+MikuMikuPhysics 是一个 Blender 4.2+ 插件，用于直接模拟由 mmd_tools 导入的 PMX/MMD 模型刚体物理。插件通过外部 `pmx_bullet.dll` 使用 Bullet，不依赖 Blender 内置 Bullet，目标是尽量接近 MMD 与 PMXEditor TransformView 的物理行为。
 
 - 作者/维护者：克里斯提亚娜
 - 插件类型：Blender Add-on / Extension
@@ -12,7 +12,7 @@ MikuMikuPhysics 是一个 Blender 4.2+ 插件，用于直接模拟由 mmd_tools 
 ## 主要功能
 
 - 直接读取 mmd_tools 导入后的 PMX 模型根对象、骨架、刚体、关节、碰撞组与骨骼绑定。
-- 使用外部 Bullet 2.82 native DLL 进行物理解算。
+- 使用外部 Bullet native DLL 进行物理解算。
 - 支持不依赖 Blender 时间线播放的实时物理预览。
 - 支持时间线模式，方便按帧模拟和动作检查。
 - 支持将物理结果烘焙为 Blender 骨骼关键帧。
@@ -50,6 +50,48 @@ MikuMikuPhysics/
 ```text
 %APPDATA%\Blender Foundation\Blender\4.2\scripts\addons\MikuMikuPhysics
 ```
+
+## 进阶操作：自行编译 Bullet DLL
+
+以下为实验性操作，非必需。如需自行编译 `pmx_bullet.dll`：
+
+### 1. 初始化子模块
+
+```bash
+git submodule update --init native/pmx_bullet/bullet3
+```
+
+如需指定版本（如 2.82）：
+
+```bash
+git -C native/pmx_bullet/bullet3 checkout 2.82
+```
+
+如需最新源码：
+
+```bash
+git submodule update --remote native/pmx_bullet/bullet3
+```
+
+### 2. 编译 DLL
+
+以下命令在 **MSYS2 / MinGW** 环境中执行：
+
+```bash
+cd <Your Path>/MikuMikuPhysics/native/pmx_bullet
+cmake -B build \
+    -D INSTALL_LIBS=ON \
+    -D USE_MSVC_RUNTIME_LIBRARY_DLL=ON \
+    -D BUILD_CPU_DEMOS=OFF \
+    -D BUILD_OPENGL3_DEMOS=OFF \
+    -D BUILD_BULLET2_DEMOS=OFF \
+    -D BUILD_UNIT_TESTS=OFF \
+    -D USE_GLUT=OFF \
+    -D BUILD_EGL=OFF
+cmake --build build
+```
+
+输出的 `pmx_bullet.dll` 在 `build/` 下，复制到上一级 `native/` 即可。
 
 ## 使用前准备
 
@@ -200,7 +242,7 @@ mmd_tools PMX model
   -> pmx_data_reader.read_model()
   -> PmxModelData / RigidBodyData / JointData
   -> ctypes bridge
-  -> native/pmx_bullet.dll (Bullet 2.82 r2704)
+  -> native/pmx_bullet.dll (Bullet)
   -> body transform readback
   -> Pose Bone / rigid object writeback
   -> Blender viewport or baked keyframes
@@ -240,7 +282,7 @@ mmd_tools PMX model
 - **MMD Bridge**：参考其 MMD 本体物理与烘焙流程。
 - **NexGiMa**：参考其 PMX/MMD 物理表现和参数风格。
 - **MikuMikuDayo**：参考其 MMD 模型与物理运行逻辑。
-- **Bullet Physics**：本插件 native 层使用 Bullet 2.82 r2704 进行物理解算。
+- **Bullet Physics**：本插件 native 层使用 Bullet 进行物理解算。
 
 如开源发布，请同时保留本 README、`LICENSE`、`COPYING`，并遵守各参考项目自身许可证。本文中的“参考”表示行为和架构层面的兼容性研究，不表示这些项目为本插件背书。
 
@@ -249,7 +291,7 @@ mmd_tools PMX model
 ### 2.0.0
 
 - 插件包名改为 `MikuMikuPhysics`，Blender N 面板标签缩写为 `MMP`。
-- 使用外部 Bullet 2.82 r2704 DLL 进行 PMX/MMD 刚体与关节模拟。
+- 使用外部 Bullet DLL 进行 PMX/MMD 刚体与关节模拟。
 - 支持实时 Timer 物理预览、时间线模式、单步、停止、强制停止与重置。
 - 支持 mmd_tools PMX 刚体/关节读取、VMD 导入入口和物理烘焙。
 - 支持多模型模拟：独立世界、影子碰撞、共享世界等模式。

@@ -1,0 +1,4 @@
+[submodule "native/pmx_bullet/bullet3"]
+	path = native/pmx_bullet/bullet3
+	url = https://github.com/bulletphysics/bullet3.git
+	branch = master
