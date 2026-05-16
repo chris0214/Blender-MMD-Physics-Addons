@@ -6,6 +6,7 @@ from .physics_world import PhysicsWorld, capture_initial_snapshot, restore_last_
 from .hybrid_physics_world import HybridPhysicsWorld
 from .shared_physics_world import SharedPhysicsWorld
 from .shadow_physics_world import ShadowPhysicsWorld
+from .types import MODE_STATIC
 
 
 _controller = None
@@ -141,7 +142,9 @@ def _effective_gravity(settings):
 
 
 def _publish_performance(settings, world):
-    if not bool(getattr(settings, "show_performance_stats", False)):
+    show_perf = bool(getattr(settings, "show_performance_stats", False))
+    show_interaction = bool(getattr(settings, "show_interaction_debug", False))
+    if not show_perf and not show_interaction:
         return
     perf = getattr(world, "performance", None)
     if not isinstance(perf, dict):
@@ -183,10 +186,18 @@ def _publish_performance(settings, world):
     settings.perf_last_disabled_model_pairs = int(perf.get("last_disabled_model_pairs", 0))
     settings.perf_last_writeback_models = int(perf.get("last_writeback_models", 0))
     settings.perf_last_contact_detect_ms = float(perf.get("last_contact_detect_ms", 0.0))
+    settings.interaction_debug_static_count = int(perf.get("interaction_static_scope_count", 0))
+    settings.interaction_debug_dynamic_count = int(perf.get("interaction_dynamic_scope_count", 0))
+    settings.interaction_debug_frozen_count = int(perf.get("interaction_frozen_dynamic_count", 0))
+    settings.interaction_debug_static_bodies = str(perf.get("interaction_static_bodies", ""))
+    settings.interaction_debug_dynamic_bodies = str(perf.get("interaction_dynamic_bodies", ""))
+    settings.interaction_debug_written_bones = str(perf.get("interaction_written_bones", ""))
 
 
 def _publish_all_performance(settings):
-    if not bool(getattr(settings, "show_performance_stats", False)):
+    show_perf = bool(getattr(settings, "show_performance_stats", False))
+    show_interaction = bool(getattr(settings, "show_interaction_debug", False))
+    if not show_perf and not show_interaction:
         return
     controllers = [controller for controller in _known_controllers() if bool(getattr(controller, "running", False))]
     if len(controllers) <= 1:
@@ -245,6 +256,26 @@ def _publish_all_performance(settings):
     settings.perf_last_disabled_model_pairs = sum(int(perf.get("last_disabled_model_pairs", 0)) for perf in perfs)
     settings.perf_last_writeback_models = sum(int(perf.get("last_writeback_models", 0)) for perf in perfs)
     settings.perf_last_contact_detect_ms = total("last_contact_detect_ms")
+    settings.interaction_debug_static_count = sum(int(perf.get("interaction_static_scope_count", 0)) for perf in perfs)
+    settings.interaction_debug_dynamic_count = sum(int(perf.get("interaction_dynamic_scope_count", 0)) for perf in perfs)
+    settings.interaction_debug_frozen_count = sum(int(perf.get("interaction_frozen_dynamic_count", 0)) for perf in perfs)
+    static_bodies = []
+    dynamic_bodies = []
+    for perf in perfs:
+        text = str(perf.get("interaction_static_bodies", ""))
+        if text:
+            static_bodies.append(text)
+        text = str(perf.get("interaction_dynamic_bodies", ""))
+        if text:
+            dynamic_bodies.append(text)
+    settings.interaction_debug_static_bodies = " | ".join(static_bodies)[:240]
+    settings.interaction_debug_dynamic_bodies = " | ".join(dynamic_bodies)[:240]
+    written = []
+    for perf in perfs:
+        text = str(perf.get("interaction_written_bones", ""))
+        if text:
+            written.append(text)
+    settings.interaction_debug_written_bones = " | ".join(written)[:240]
 
 
 def _scene_fps(scene):
@@ -424,6 +455,11 @@ class TimerController:
         self.has_armature_action = _has_armature_action(world)
         self._internal_frame_set = False
         self._was_animation_playing = _is_animation_playing()
+        self._interaction_snapshot = self._capture_interaction_snapshot()
+        self._last_interaction_pose_bones = set()
+        self._held_interaction_pose_bones = set()
+        self._interaction_pose_hold_until = 0.0
+        self._last_interaction_response = 0.0
         self.rigidbody_world, self.previous_rigidbody_enabled = _disable_blender_rigidbody_world(scene)
 
     def tick(self):
@@ -448,6 +484,13 @@ class TimerController:
                 return max(0.001, fixed_step * 0.5)
             if self._sync_changed_scene_frame(fixed_step):
                 return max(0.001, fixed_step * 0.5)
+            interaction_kind = "NONE"
+            if not is_animation_playing:
+                interaction_kind = self._interaction_change_kind()
+                self._configure_interaction_pose_scope(interaction_kind, now)
+            if self._maybe_interaction_response(now, fixed_step, interaction_kind):
+                _publish_all_performance(self.settings)
+                return 0.001
 
             steps = 0
             max_steps = int(self.settings.max_substeps)
@@ -471,6 +514,7 @@ class TimerController:
                     flush_start = time.perf_counter()
                     self.world.flush_depsgraph()
                     flush_ms += (time.perf_counter() - flush_start) * 1000.0
+                    self._interaction_snapshot = self._capture_interaction_snapshot()
                 self.world.record_flush_time(flush_ms)
                 self.world.record_tick_time((time.perf_counter() - tick_start) * 1000.0, steps)
                 _publish_all_performance(self.settings)
@@ -481,6 +525,413 @@ class TimerController:
             self.settings.is_running = False
             self.stop()
             return None
+
+    def _capture_interaction_snapshot(self):
+        matrices = {}
+        for root in self._iter_world_roots():
+            if root is None:
+                continue
+            matrices[f"root:{root.name}"] = root.matrix_world.copy()
+            armature = self._find_armature(root)
+            if armature is not None:
+                matrices[f"armature:{armature.name}"] = armature.matrix_world.copy()
+                for pose_bone in self._iter_interaction_pose_bones(root, armature):
+                    matrices[f"pose:{armature.name}:{pose_bone.name}"] = pose_bone.matrix.copy()
+        return matrices
+
+    def _iter_world_roots(self):
+        roots = getattr(self.world, "roots", None)
+        if roots is not None:
+            return list(roots)
+        root = getattr(self.world, "root", None)
+        if root is not None:
+            return [root]
+        worlds = getattr(self.world, "worlds", None)
+        if worlds is not None:
+            result = []
+            for world in worlds:
+                root = getattr(world, "root", None)
+                if root is not None:
+                    result.append(root)
+            return result
+        # Fallback: derive the root from `world.model`/`world.models` so
+        # interaction-scope plumbing keeps working even on world classes that
+        # forgot to expose `root`/`roots` directly. Without this fallback a
+        # single-model PhysicsWorld would report zero roots, the scope would
+        # always be empty, and user-bone selection could not constrain the
+        # interaction scope.
+        models = getattr(self.world, "models", None) or []
+        result = []
+        for model in models:
+            model_root = getattr(model, "root", None)
+            if model_root is not None:
+                result.append(model_root)
+        if result:
+            return result
+        model = getattr(self.world, "model", None)
+        if model is not None:
+            model_root = getattr(model, "root", None)
+            if model_root is not None:
+                return [model_root]
+        return []
+
+    def _find_armature(self, root):
+        if getattr(root, "type", None) == "ARMATURE":
+            return root
+        for child in getattr(root, "children_recursive", []):
+            if getattr(child, "type", None) == "ARMATURE":
+                return child
+        return None
+
+    def _iter_interaction_pose_bones(self, root, armature):
+        model = self._find_world_model(root)
+        names = set()
+        if model is not None:
+            for rigid in getattr(model, "rigid_bodies", []):
+                if getattr(rigid, "mode", None) != MODE_STATIC:
+                    continue
+                bone_name = getattr(rigid, "bone_name", "")
+                if bone_name:
+                    names.add(bone_name)
+
+        active_bone_name = self._active_pose_bone_name(armature)
+        if active_bone_name:
+            names.add(active_bone_name)
+        for scoped_armature, bone_name in self._selected_pose_bone_scope_for_armature(armature):
+            if scoped_armature == armature.name and bone_name:
+                names.add(bone_name)
+
+        if not names and model is None:
+            for pose_bone in armature.pose.bones:
+                yield pose_bone
+            return
+
+        for bone_name in names:
+            pose_bone = armature.pose.bones.get(bone_name)
+            if pose_bone is not None:
+                yield pose_bone
+
+    def _find_world_model(self, root):
+        model = getattr(self.world, "model", None)
+        if model is not None and getattr(model, "root", None) == root:
+            return model
+        for model in getattr(self.world, "models", []) or []:
+            if getattr(model, "root", None) == root:
+                return model
+        for world in getattr(self.world, "worlds", []) or []:
+            model = getattr(world, "model", None)
+            if model is not None and getattr(model, "root", None) == root:
+                return model
+        return None
+
+    def _matrix_changed(self, previous, current):
+        if previous is None:
+            return True
+        delta = previous.inverted_safe() @ current
+        translation = delta.to_translation().length
+        try:
+            rotation = delta.to_quaternion().angle
+        except Exception:
+            rotation = 0.0
+        return translation > 0.00005 or rotation > 0.0002
+
+    def _interaction_change_kind(self):
+        current = self._capture_interaction_snapshot()
+        self._last_interaction_pose_bones = set()
+        if set(current.keys()) != set(self._interaction_snapshot.keys()):
+            changed_keys = set(current.keys()).symmetric_difference(self._interaction_snapshot.keys())
+            self._interaction_snapshot = current
+            if not changed_keys or any(not key.startswith("pose:") for key in changed_keys):
+                return "TRANSFORM"
+            filtered_scope = self._preferred_interaction_pose_scope(
+                self._pose_bone_keys_to_scope(changed_keys),
+                prefer_changed=False,
+            )
+            if filtered_scope:
+                self._last_interaction_pose_bones = filtered_scope
+                return "POSE"
+            return "NONE"
+        changed_keys = [
+            key
+            for key, matrix in current.items()
+            if self._matrix_changed(self._interaction_snapshot.get(key), matrix)
+        ]
+        if changed_keys:
+            self._interaction_snapshot = current
+        if not changed_keys:
+            fallback_scope = self._preferred_interaction_pose_scope(prefer_changed=False)
+            if fallback_scope:
+                self._last_interaction_pose_bones = fallback_scope
+                return "POSE"
+            if self._held_interaction_pose_bones:
+                self._last_interaction_pose_bones = set(self._held_interaction_pose_bones)
+                return "POSE"
+            return "NONE"
+        if any(not key.startswith("pose:") for key in changed_keys):
+            return "TRANSFORM"
+        changed_scope = self._pose_bone_keys_to_scope(changed_keys)
+        filtered_scope = self._preferred_interaction_pose_scope(changed_scope)
+        if not filtered_scope:
+            return "NONE"
+        self._last_interaction_pose_bones = filtered_scope
+        return "POSE"
+
+    def _preferred_interaction_pose_scope(self, changed_scope=None, prefer_changed=True):
+        active_scope = self._filter_scope_to_input_bones(self._active_pose_bone_scope())
+        changed_scope = self._filter_scope_to_input_bones(changed_scope or set())
+        selected_scope = self._filter_scope_to_input_bones(self._selected_pose_bone_scope())
+        # The "changed" scope is sampled from every static-bound bone's pose
+        # matrix, which means parent-chain propagation (e.g. moving an arm
+        # nudges the head/hip/skirt-root pose matrices by tiny amounts) would
+        # leak unrelated bones into the interaction scope. Intersect with the
+        # bones the user actually selected/activated so the scope only covers
+        # what the user is dragging. Fall back to the raw changed set only when
+        # there is no selection at all (e.g. running from a script).
+        user_scope = active_scope | selected_scope
+        if user_scope:
+            constrained = changed_scope & user_scope if changed_scope else set()
+            if prefer_changed:
+                return constrained or user_scope
+            return user_scope or constrained
+        if prefer_changed:
+            return changed_scope or active_scope or selected_scope
+        return active_scope or selected_scope or changed_scope
+
+    @staticmethod
+    def _pose_bone_keys_to_scope(keys):
+        scope = set()
+        for key in keys:
+            parts = key.split(":", 2)
+            if len(parts) == 3 and parts[0] == "pose":
+                scope.add((parts[1], parts[2]))
+        return scope
+
+    def _selected_pose_bone_scope(self):
+        obj = getattr(bpy.context, "object", None)
+        if obj is None or getattr(obj, "type", None) != "ARMATURE":
+            return set()
+        return self._selected_pose_bone_scope_for_armature(obj)
+
+    def _selected_pose_bone_scope_for_armature(self, obj):
+        if obj is None or getattr(obj, "type", None) != "ARMATURE":
+            return set()
+        known_armatures = {
+            armature.name
+            for root in self._iter_world_roots()
+            for armature in [self._find_armature(root)]
+            if armature is not None
+        }
+        if obj.name not in known_armatures:
+            return set()
+
+        scope = set()
+        selected = getattr(bpy.context, "selected_pose_bones", None) or []
+        for pose_bone in selected:
+            scope.add((obj.name, pose_bone.name))
+
+        active_bone = getattr(obj.data.bones, "active", None)
+        if active_bone is not None:
+            scope.add((obj.name, active_bone.name))
+        return scope
+
+    def _active_pose_bone_scope(self):
+        obj = getattr(bpy.context, "object", None)
+        if obj is None or getattr(obj, "type", None) != "ARMATURE":
+            return set()
+        if obj.name not in {
+            armature.name
+            for root in self._iter_world_roots()
+            for armature in [self._find_armature(root)]
+            if armature is not None
+        }:
+            return set()
+        active_name = self._active_pose_bone_name(obj)
+        if not active_name:
+            return set()
+        return {(obj.name, active_name)}
+
+    @staticmethod
+    def _active_pose_bone_name(armature):
+        active = getattr(getattr(armature, "data", None), "bones", None)
+        active = getattr(active, "active", None)
+        if active is not None:
+            return active.name
+        pose_bone = getattr(bpy.context, "active_pose_bone", None)
+        if pose_bone is not None and getattr(getattr(pose_bone, "id_data", None), "name", None) == armature.name:
+            return pose_bone.name
+        return ""
+
+    def _filter_scope_to_input_bones(self, scope):
+        if not scope:
+            return set()
+        result = set()
+        for armature_name, bone_name in scope:
+            root = self._root_for_armature_name(armature_name)
+            if root is None:
+                result.add((armature_name, bone_name))
+                continue
+            model = self._find_world_model(root)
+            if model is None:
+                result.add((armature_name, bone_name))
+                continue
+            input_names = self._interaction_input_bone_names(model)
+            armature = self._find_armature(root)
+            if bone_name in input_names:
+                result.add((armature_name, bone_name))
+                continue
+            descendant = self._nearest_input_descendant(armature, bone_name, input_names)
+            if descendant:
+                result.add((armature_name, descendant))
+        return result
+
+    def _root_for_armature_name(self, armature_name):
+        for root in self._iter_world_roots():
+            armature = self._find_armature(root)
+            if armature is not None and armature.name == armature_name:
+                return root
+        return None
+
+    @staticmethod
+    def _interaction_input_bone_names(model):
+        return {
+            getattr(rigid, "bone_name", "")
+            for rigid in getattr(model, "rigid_bodies", [])
+            if getattr(rigid, "mode", None) == MODE_STATIC and getattr(rigid, "bone_name", "")
+        }
+
+    @staticmethod
+    def _bone_has_input_descendant(armature, bone_name, input_names):
+        if armature is None or not input_names:
+            return False
+        pose_bone = armature.pose.bones.get(bone_name)
+        if pose_bone is None:
+            return False
+        pending = list(pose_bone.children)
+        while pending:
+            child = pending.pop()
+            if child.name in input_names:
+                return True
+            pending.extend(child.children)
+        return False
+
+    @staticmethod
+    def _nearest_input_descendant(armature, bone_name, input_names):
+        if armature is None or not input_names:
+            return ""
+        pose_bone = armature.pose.bones.get(bone_name)
+        if pose_bone is None:
+            return ""
+        pending = list(pose_bone.children)
+        while pending:
+            next_pending = []
+            for child in pending:
+                if child.name in input_names:
+                    return child.name
+                next_pending.extend(child.children)
+            pending = next_pending
+        return ""
+
+    def _configure_interaction_pose_scope(self, change_kind, now=None):
+        setter = getattr(self.world, "set_interaction_pose_scope", None)
+        if setter is None:
+            return
+        if change_kind == "POSE":
+            self._held_interaction_pose_bones = set(self._last_interaction_pose_bones)
+            self._interaction_pose_hold_until = (now or time.perf_counter()) + 2.0
+            setter(self._held_interaction_pose_bones)
+        elif self._active_pose_scope_matches_held():
+            self._interaction_pose_hold_until = (now or time.perf_counter()) + 2.0
+            setter(self._held_interaction_pose_bones)
+        elif (
+            self._held_interaction_pose_bones
+            and now is not None
+            and now < self._interaction_pose_hold_until
+        ):
+            setter(self._held_interaction_pose_bones)
+        else:
+            self._held_interaction_pose_bones = set()
+            self._interaction_pose_hold_until = 0.0
+            setter(None)
+        self._publish_interaction_debug(change_kind)
+
+    def _active_pose_scope_matches_held(self):
+        if not self._held_interaction_pose_bones:
+            return False
+        active_scope = self._filter_scope_to_input_bones(self._active_pose_bone_scope())
+        return bool(active_scope and active_scope == self._held_interaction_pose_bones)
+
+    def _publish_interaction_debug(self, change_kind):
+        if not bool(getattr(self.settings, "show_interaction_debug", False)):
+            return
+        self.settings.interaction_debug_kind = str(change_kind)
+        if self._held_interaction_pose_bones:
+            names = sorted({bone_name for _armature_name, bone_name in self._held_interaction_pose_bones})
+        else:
+            names = []
+        self.settings.interaction_debug_scope = self._format_debug_names(names)
+
+    @staticmethod
+    def _format_debug_names(names, limit=8):
+        names = [str(name) for name in names if name]
+        if not names:
+            return ""
+        shown = names[:limit]
+        suffix = f" +{len(names) - limit}" if len(names) > limit else ""
+        return ", ".join(shown) + suffix
+
+    def _maybe_interaction_response(self, now, fixed_step, change_kind=None):
+        mode = getattr(self.settings, "interaction_response_mode", "OFF")
+        if mode == "OFF":
+            return False
+        if _is_animation_playing():
+            return False
+        min_interval = max(0.001, float(getattr(self.settings, "interaction_response_min_interval", 0.008)))
+        if now - self._last_interaction_response < min_interval:
+            return False
+        if change_kind is None:
+            change_kind = self._interaction_change_kind()
+            self._configure_interaction_pose_scope(change_kind, now)
+        if change_kind == "NONE":
+            return False
+
+        response_start = time.perf_counter()
+        self._last_interaction_response = now
+        self.world.configure_apply_options(_realtime_apply_options(self.settings))
+        flush_start = time.perf_counter()
+        self.world.flush_depsgraph()
+        flush_ms = (time.perf_counter() - flush_start) * 1000.0
+        if change_kind == "POSE":
+            sync = getattr(self.world, "sync_kinematic_only", None)
+            synced = sync() if sync is not None else 0
+            if mode != "IMMEDIATE":
+                self.world.record_flush_time(flush_ms)
+                self.world.record_tick_time((time.perf_counter() - response_start) * 1000.0, 0)
+                self.settings.status = f"{bpy.app.translations.pgettext_iface('Kinematic synced')} {synced}"
+                _publish_performance(self.settings, self.world)
+                return False
+
+        step_scale = max(0.05, min(1.0, float(getattr(self.settings, "interaction_response_step_scale", 0.75))))
+        response_steps = 3 if mode == "IMMEDIATE" else 1
+        response_timestep = fixed_step * _time_scale(self.settings) * step_scale / response_steps
+        snapped = 0
+        if mode == "IMMEDIATE":
+            snap = getattr(self.world, "interaction_snap_dynamic_bones", None)
+            if snap is not None:
+                pose_bones = self._last_interaction_pose_bones if change_kind == "POSE" else None
+                snapped = snap(clear_velocity=False, pose_bones=pose_bones)
+        for _ in range(response_steps):
+            self.world.step(response_timestep, 1, apply_results=True)
+        flush_start = time.perf_counter()
+        self.world.flush_depsgraph()
+        flush_ms += (time.perf_counter() - flush_start) * 1000.0
+        self.world.record_flush_time(flush_ms)
+        self.world.record_tick_time((time.perf_counter() - response_start) * 1000.0, response_steps)
+        if snapped:
+            self.settings.status = f"{bpy.app.translations.pgettext_iface('Interaction snapped')} {snapped}"
+        _publish_performance(self.settings, self.world)
+        self._interaction_snapshot = self._capture_interaction_snapshot()
+        self.accumulator = min(self.accumulator, fixed_step if mode == "IMMEDIATE" else fixed_step * 0.5)
+        return True
 
     def _last_step_wrote_results(self):
         performance = getattr(self.world, "performance", {})
