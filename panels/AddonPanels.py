@@ -112,6 +112,7 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
         col.prop(settings, "debug_force_visible")
         row = col.row(align=True)
         row.operator("pmx_physics.apply_debug_visuals", icon="HIDE_OFF")
+        row.operator("pmx_physics.apply_all_debug_visuals", icon="OUTLINER_COLLECTION")
         row.operator("pmx_physics.clear_debug_visuals", icon="LOOP_BACK")
 
         is_running = settings.is_running or physics_sync.is_active()
@@ -167,8 +168,26 @@ class PMXPHYSICS_PT_main(bpy.types.Panel):
             _perf_row(grid, "Depsgraph", settings.perf_last_flush_ms, settings.perf_avg_flush_ms, settings.perf_max_flush_ms)
 
         box = layout.box()
+        row = box.row(align=True)
+        row.prop(settings, "show_interaction_debug", text="")
+        row.label(text="交互调试")
+        if settings.show_interaction_debug:
+            col = box.column(align=True)
+            col.label(text=f"类型: {settings.interaction_debug_kind or '-'}")
+            col.label(text=f"作用域: {settings.interaction_debug_scope or '-'}")
+            col.label(text=f"静态 {settings.interaction_debug_static_count} / 动态 {settings.interaction_debug_dynamic_count} / 冻结 {settings.interaction_debug_frozen_count}")
+            col.label(text=f"静态源: {settings.interaction_debug_static_bodies or '-'}")
+            col.label(text=f"动态源: {settings.interaction_debug_dynamic_bodies or '-'}")
+            col.label(text=f"写回: {settings.interaction_debug_written_bones or '-'}")
+            col.operator("pmx_physics.dump_interaction_debug", icon="TEXT")
+
+        box = layout.box()
         box.label(text="Realtime Performance")
         col = box.column(align=True)
+        col.prop(settings, "interaction_response_mode")
+        if settings.interaction_response_mode != "OFF":
+            col.prop(settings, "interaction_response_min_interval")
+            col.prop(settings, "interaction_response_step_scale")
         col.prop(settings, "realtime_update_rigid_objects")
         col.prop(settings, "realtime_follow_root_motion")
         col.prop(settings, "realtime_drag_compensation")

@@ -50,6 +50,10 @@ class SharedPhysicsWorld:
     def configure_contact_gate(self, enabled):
         self._contact_gate_enabled = bool(enabled)
 
+    def set_interaction_pose_scope(self, pose_bones=None):
+        for model_world in self._model_worlds:
+            model_world.set_interaction_pose_scope(pose_bones)
+
     def initialize(
         self,
         context,
@@ -259,6 +263,42 @@ class SharedPhysicsWorld:
         self._last_shared_body_matrices = self._copy_matrices(self.native.get_body_transforms(self._body_count()))
         self.flush_depsgraph()
 
+    def sync_kinematic_only(self):
+        if self.native is None:
+            return 0
+        kinematic = self._current_kinematic_matrices()
+        self.native.set_kinematic_transforms(kinematic)
+        self._last_kinematic_matrices = self._copy_matrices(kinematic)
+        return len(kinematic)
+
+    def interaction_snap_dynamic_bones(self, clear_velocity=False, pose_bones=None):
+        if self.native is None:
+            return 0
+        transforms = {}
+        for model_world, offset in zip(self._model_worlds, self._offsets):
+            model = model_world.model
+            if model is None:
+                continue
+            affected_indices = model_world._interaction_affected_dynamic_bone_indices(pose_bones)
+            if affected_indices is not None and not affected_indices:
+                continue
+            for rigid in model.rigid_bodies:
+                if rigid.mode != MODE_DYNAMIC_BONE:
+                    continue
+                if affected_indices is not None and rigid.index not in affected_indices:
+                    continue
+                if not rigid.bone_name or rigid.bone_offset_matrix is None:
+                    continue
+                matrix = model_world._current_body_matrix(rigid)
+                transforms[offset + rigid.index] = self._model_to_shared_matrix(model, matrix)
+        if not transforms:
+            return 0
+        if clear_velocity:
+            self.native.freeze_body_transforms(transforms)
+        else:
+            self.native.temporal_kinematic_init(transforms)
+        return len(transforms)
+
     def flush_depsgraph(self):
         if self._view_layer is None:
             return
@@ -370,6 +410,11 @@ class SharedPhysicsWorld:
             total_object_writes += int(model_world.performance.get("last_object_writes", 0))
         self.performance["last_bone_writes"] = total_bone_writes
         self.performance["last_object_writes"] = total_object_writes
+        self.performance["interaction_static_scope_count"] = sum(int(world.performance.get("interaction_static_scope_count", 0)) for world in self._model_worlds)
+        self.performance["interaction_dynamic_scope_count"] = sum(int(world.performance.get("interaction_dynamic_scope_count", 0)) for world in self._model_worlds)
+        self.performance["interaction_frozen_dynamic_count"] = sum(int(world.performance.get("interaction_frozen_dynamic_count", 0)) for world in self._model_worlds)
+        written = [str(world.performance.get("interaction_written_bones", "")) for world in self._model_worlds if world.performance.get("interaction_written_bones", "")]
+        self.performance["interaction_written_bones"] = " | ".join(written)[:240]
 
     def _preserve_dynamic_world_space_on_root_motion(self):
         # Shared-world root dragging needs a different preservation strategy than

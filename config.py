@@ -197,7 +197,7 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
             ("SHARED_COLLISION", "Shadow Collision", "Babylon-MMD-style per-model Bullet worlds with kinematic shadow colliders for inter-model collision"),
             ("GLOBAL_SHARED", "Full Shared World", "Experimental: all enabled models share one dynamic Bullet world from simulation start"),
         ),
-        default="ROOT_ISOLATED",
+        default="SHARED_COLLISION",
     )
 
     dll_path: bpy.props.StringProperty(
@@ -218,7 +218,7 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
             ("HZ_30", "30 Hz (0.03333)", "Low precision preview step"),
             ("CUSTOM", "Custom", "Use the custom fixed step value"),
         ),
-        default="HZ_60",
+        default="HZ_120",
     )
 
     fixed_timestep: bpy.props.FloatProperty(
@@ -233,7 +233,7 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
     max_substeps: bpy.props.IntProperty(
         name="Max Substeps",
         description="Maximum physics substeps per Blender timer tick",
-        default=2,
+        default=8,
         min=1,
         max=16,
     )
@@ -521,6 +521,12 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
         default=False,
     )
 
+    show_interaction_debug: bpy.props.BoolProperty(
+        name="显示交互调试",
+        description="显示交互作用域、刚体筛选和骨骼写回诊断",
+        default=False,
+    )
+
     realtime_update_rigid_objects: bpy.props.BoolProperty(
         name="Update Rigid Objects",
         description="Write physics transforms back to mmd_tools rigid body objects during realtime preview",
@@ -531,6 +537,39 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
         name="Follow Root Motion",
         description="Move dynamic rigid bodies with the PMX model root during realtime dragging",
         default=True,
+    )
+
+    interaction_response_mode: bpy.props.EnumProperty(
+        name="Interaction Response",
+        description=(
+            "Reduce viewport drag latency by reacting to object or armature changes between regular timer steps. "
+            "Immediate isolates physics to the bone you are dragging so unrelated cloth/hair stays stable, "
+            "matching MMD-native pose-editing behavior"
+        ),
+        items=(
+            ("OFF", "Off", "Use regular timer stepping only"),
+            ("BALANCED", "Balanced", "Run one lightweight response step after interactive transforms"),
+            ("IMMEDIATE", "Immediate", "Run multiple response steps for faster viewport drag following"),
+        ),
+        default="IMMEDIATE",
+    )
+
+    interaction_response_min_interval: bpy.props.FloatProperty(
+        name="Response Min Interval",
+        description="Minimum seconds between interactive response steps",
+        default=0.004,
+        min=0.001,
+        max=0.1,
+        precision=4,
+    )
+
+    interaction_response_step_scale: bpy.props.FloatProperty(
+        name="Response Step Scale",
+        description="Scale of the fixed timestep used by interactive response steps",
+        default=0.75,
+        min=0.05,
+        max=1.0,
+        precision=3,
     )
 
     realtime_drag_compensation: bpy.props.BoolProperty(
@@ -745,6 +784,14 @@ class PMXPhysicsSettings(bpy.types.PropertyGroup):
     perf_last_disabled_model_pairs: bpy.props.IntProperty(name="Disabled Model Pairs", default=0, options={"SKIP_SAVE"})
     perf_last_writeback_models: bpy.props.IntProperty(name="Writeback Models", default=0, options={"SKIP_SAVE"})
     perf_last_contact_detect_ms: bpy.props.FloatProperty(name="Contact Detect ms", default=0.0, precision=3, options={"SKIP_SAVE"})
+    interaction_debug_kind: bpy.props.StringProperty(name="Interaction Kind", default="", options={"SKIP_SAVE"})
+    interaction_debug_scope: bpy.props.StringProperty(name="Interaction Scope", default="", options={"SKIP_SAVE"})
+    interaction_debug_static_count: bpy.props.IntProperty(name="Static Scope", default=0, options={"SKIP_SAVE"})
+    interaction_debug_dynamic_count: bpy.props.IntProperty(name="Dynamic Scope", default=0, options={"SKIP_SAVE"})
+    interaction_debug_frozen_count: bpy.props.IntProperty(name="Frozen Dynamic", default=0, options={"SKIP_SAVE"})
+    interaction_debug_static_bodies: bpy.props.StringProperty(name="Static Bodies", default="", options={"SKIP_SAVE"})
+    interaction_debug_dynamic_bodies: bpy.props.StringProperty(name="Dynamic Bodies", default="", options={"SKIP_SAVE"})
+    interaction_debug_written_bones: bpy.props.StringProperty(name="Written Bones", default="", options={"SKIP_SAVE"})
 
     def resolved_dll_path(self):
         path = self.dll_path.strip()

@@ -79,6 +79,12 @@ def _new_performance():
         "max_smoothing_segments": 1,
         "last_bone_writes": 0,
         "last_object_writes": 0,
+        "interaction_static_scope_count": 0,
+        "interaction_dynamic_scope_count": 0,
+        "interaction_frozen_dynamic_count": 0,
+        "interaction_static_bodies": "",
+        "interaction_dynamic_bodies": "",
+        "interaction_written_bones": "",
     }
     for key in _PERF_STAGE_KEYS:
         performance[f"last_{key}"] = 0.0
@@ -235,6 +241,18 @@ class PhysicsWorld:
         self._drag_resync_indices = set()
         self.performance = _new_performance()
 
+    @property
+    def root(self):
+        # Exposed so that physics_sync._iter_world_roots() can locate the
+        # model root (and from there the armature) for single-model
+        # PhysicsWorld instances. Without this property the interaction-scope
+        # selection plumbing returns no armatures, so user-selected bones
+        # never make it into the scope and parent-chain pose-matrix changes
+        # leak unrelated cloth/hair bones into the drag-compensation set.
+        if self.model is None:
+            return None
+        return self.model.root
+
     def initialize(
         self,
         context,
@@ -333,12 +351,14 @@ class PhysicsWorld:
         self._drag_resync_pending = False
         self._drag_resync_indices = set()
         self._muted_action_fcurves = []
+        self._interaction_pose_scope = None
         self.apply_options = _default_apply_options()
         self._bone_target_entries = []
         self._physics_pose_bones = []
         self._last_written_bone_targets = {}
         self._last_object_targets = {}
         self._last_root_world = None
+        self._interaction_pose_scope = None
         self.performance = _new_performance()
 
     def set_initial_snapshot(self, snapshot):
@@ -348,6 +368,16 @@ class PhysicsWorld:
 
     def configure_apply_options(self, options):
         self.apply_options = _normalize_apply_options(options)
+
+    def set_interaction_pose_scope(self, pose_bones=None):
+        self._interaction_pose_scope = pose_bones
+        if pose_bones is None:
+            self.performance["interaction_static_scope_count"] = 0
+            self.performance["interaction_dynamic_scope_count"] = 0
+            self.performance["interaction_frozen_dynamic_count"] = 0
+            self.performance["interaction_static_bodies"] = ""
+            self.performance["interaction_dynamic_bodies"] = ""
+            self.performance["interaction_written_bones"] = ""
 
     def reset(self):
         self.restore_initial_state()
@@ -476,6 +506,17 @@ class PhysicsWorld:
         self._prepare_drag_dynamic_compensation()
         collect_ms = (time.perf_counter() - collect_start) * 1000.0
         native_start = time.perf_counter()
+        # Previously we collected every out-of-scope dynamic body and called
+        # `freeze_body_transforms` on them after stepping, which pinned cloth
+        # and hair in place during pose-mode dragging. That broke the MMD-like
+        # expectation of "drag a bone while everything else keeps simulating".
+        # Out-of-scope dynamics are *guaranteed* to be joint-disconnected from
+        # the in-scope drag region (the scope expansion in
+        # `_interaction_dynamic_indices_from_static_scope` walks every joint
+        # neighbor), and their matching STATIC anchors are already pinned to
+        # the previous-frame kinematic matrix in `_current_body_matrices` so
+        # parent-chain pose-matrix bleed-through cannot pull them either. Let
+        # them free-run.
         self._step_with_kinematic_smoothing(kinematic_matrices, timestep, max_substeps)
         native_ms = (time.perf_counter() - native_start) * 1000.0
         self._last_kinematic_matrices = self._copy_matrices(kinematic_matrices)
@@ -499,6 +540,182 @@ class PhysicsWorld:
                 "apply_ms": apply_ms,
             },
         )
+
+    def sync_kinematic_only(self):
+        if self.native is None or self.model is None:
+            return 0
+        kinematic_matrices = self._current_body_matrices(include_dynamic=False)
+        self.native.set_kinematic_transforms(kinematic_matrices)
+        self._last_kinematic_matrices = self._copy_matrices(kinematic_matrices)
+        return len(kinematic_matrices)
+
+    def interaction_snap_dynamic_bones(self, clear_velocity=False, pose_bones=None):
+        if self.native is None or self.model is None:
+            return 0
+
+        affected_indices = self._interaction_affected_dynamic_bone_indices(pose_bones)
+        if affected_indices is not None and not affected_indices:
+            return 0
+
+        transforms = {}
+        for rigid in self.model.rigid_bodies:
+            if rigid.mode != MODE_DYNAMIC_BONE:
+                continue
+            if affected_indices is not None and rigid.index not in affected_indices:
+                continue
+            if not rigid.bone_name or rigid.bone_offset_matrix is None:
+                continue
+            transforms[rigid.index] = self._current_body_matrix(rigid)
+
+        if not transforms:
+            return 0
+        if clear_velocity:
+            self.native.freeze_body_transforms(transforms)
+        else:
+            self.native.temporal_kinematic_init(transforms)
+        return len(transforms)
+
+    def _interaction_affected_dynamic_bone_indices(self, pose_bones):
+        if pose_bones is None:
+            return None
+        if self.model is None or self.model.armature is None:
+            return set()
+
+        dynamic_indices = self._interaction_dynamic_indices_from_static_scope(pose_bones)
+        return {
+            rigid.index
+            for rigid in self.model.rigid_bodies
+            if rigid.mode == MODE_DYNAMIC_BONE and rigid.index in dynamic_indices
+        }
+
+    def _interaction_affected_dynamic_indices(self):
+        pose_bones = getattr(self, "_interaction_pose_scope", None)
+        if pose_bones is None:
+            self.performance["interaction_dynamic_scope_count"] = 0
+            return None
+        indices = self._interaction_dynamic_indices_from_static_scope(pose_bones)
+        self.performance["interaction_dynamic_scope_count"] = len(indices)
+        self.performance["interaction_dynamic_bodies"] = self._format_debug_names(
+            self._rigid_names_for_indices(indices),
+            limit=8,
+        )
+        return indices
+
+    def _interaction_dynamic_indices_from_static_scope(self, pose_bones):
+        static_indices = self._interaction_static_indices_for_pose_scope(pose_bones)
+        if not static_indices:
+            return set()
+
+        rigid_by_index = {rigid.index: rigid for rigid in self.model.rigid_bodies}
+        dynamic_indices = set()
+        seeds = set()
+
+        for joint in self.model.joints:
+            a = rigid_by_index.get(joint.rigid_a_index)
+            b = rigid_by_index.get(joint.rigid_b_index)
+            if a is None or b is None:
+                continue
+            if a.index in static_indices and b.mode in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                seeds.add(b.index)
+            elif b.index in static_indices and a.mode in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                seeds.add(a.index)
+
+        pending = list(seeds)
+        while pending:
+            index = pending.pop()
+            if index in dynamic_indices:
+                continue
+            rigid = rigid_by_index.get(index)
+            if rigid is None or rigid.mode not in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                continue
+            dynamic_indices.add(index)
+            for neighbor in self._dynamic_joint_neighbors(index, rigid_by_index):
+                if neighbor not in dynamic_indices:
+                    pending.append(neighbor)
+        return dynamic_indices
+
+    def _interaction_static_indices_for_pose_scope(self, pose_bones):
+        input_bone_names = self._interaction_input_bone_names(pose_bones)
+        if not input_bone_names:
+            return set()
+        return {
+            rigid.index
+            for rigid in self.model.rigid_bodies
+            if rigid.mode == MODE_STATIC and rigid.bone_name in input_bone_names
+        }
+
+    def _dynamic_joint_neighbors(self, rigid_index, rigid_by_index):
+        for joint in self.model.joints:
+            neighbor_index = None
+            if joint.rigid_a_index == rigid_index:
+                neighbor_index = joint.rigid_b_index
+            elif joint.rigid_b_index == rigid_index:
+                neighbor_index = joint.rigid_a_index
+            if neighbor_index is None:
+                continue
+            neighbor = rigid_by_index.get(neighbor_index)
+            if neighbor is not None and neighbor.mode in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                yield neighbor.index
+
+    def _interaction_preserved_dynamic_transforms(self):
+        if self.native is None or self.model is None:
+            return {}
+        dynamic_scope = self._interaction_affected_dynamic_indices()
+        if dynamic_scope is None:
+            self.performance["interaction_frozen_dynamic_count"] = 0
+            return {}
+
+        body_matrices = self.native.get_body_transforms(len(self.model.rigid_bodies))
+        preserved = {}
+        for rigid in self.model.rigid_bodies:
+            if rigid.mode not in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
+                continue
+            if rigid.index in dynamic_scope:
+                continue
+            matrix = body_matrices.get(rigid.index)
+            if matrix is not None:
+                preserved[rigid.index] = matrix
+        self.performance["interaction_frozen_dynamic_count"] = len(preserved)
+        return preserved
+
+    def _interaction_affected_bone_names(self, pose_bones):
+        if self.model is None or self.model.armature is None or not pose_bones:
+            return set()
+
+        armature = self.model.armature
+        changed_bone_names = {
+            bone_name
+            for scoped_armature, bone_name in pose_bones
+            if scoped_armature == armature.name
+        }
+        if not changed_bone_names:
+            return set()
+
+        affected = set(changed_bone_names)
+        pending = [
+            armature.pose.bones.get(bone_name)
+            for bone_name in changed_bone_names
+        ]
+        pending = [pose_bone for pose_bone in pending if pose_bone is not None]
+        while pending:
+            pose_bone = pending.pop()
+            for child in pose_bone.children:
+                if child.name in affected:
+                    continue
+                affected.add(child.name)
+                pending.append(child)
+        return affected
+
+    def _interaction_input_bone_names(self, pose_bones):
+        if self.model is None or self.model.armature is None or not pose_bones:
+            return set()
+
+        armature_name = self.model.armature.name
+        return {
+            bone_name
+            for scoped_armature, bone_name in pose_bones
+            if scoped_armature == armature_name and bone_name
+        }
 
     def _preserve_dynamic_world_space_on_root_motion(self):
         if self.native is None or self.model is None or self.model.root is None:
@@ -690,9 +907,15 @@ class PhysicsWorld:
         ):
             return
 
+        dynamic_scope = self._interaction_affected_dynamic_indices()
+        if dynamic_scope is not None and not dynamic_scope:
+            return
+
         body_matrices = self.native.get_body_transforms(len(self.model.rigid_bodies))
         for rigid in self.model.rigid_bodies:
             if rigid.mode != MODE_DYNAMIC_BONE:
+                continue
+            if dynamic_scope is not None and rigid.index not in dynamic_scope:
                 continue
             previous = body_matrices.get(rigid.index)
             if previous is None:
@@ -875,6 +1098,24 @@ class PhysicsWorld:
 
     def _current_body_matrices(self, include_dynamic):
         matrices = {}
+        if not include_dynamic:
+            # Touch the static-scope helper so debug metrics
+            # (`interaction_static_scope_count`, `interaction_static_bodies`)
+            # still get published even though we no longer use the result to
+            # gate kinematic following.
+            self._interaction_affected_static_indices()
+        # Every kinematic STATIC body must follow its current bone matrix on
+        # every frame, identical to MMD's behavior. Earlier versions pinned
+        # out-of-scope STATIC bodies to the previous frame's kinematic matrix
+        # in an attempt to mask parent-chain pose-matrix bleed, but that broke
+        # the bone hierarchy: dragging the upper-arm bone left the forearm /
+        # hand / finger STATIC anchors stuck in their pre-drag positions while
+        # the underlying bones rotated through them, which caused arm dynamics
+        # to explode at the joints and made self-collision visually disappear
+        # because the static collision shells were lagging the visible mesh.
+        # The interaction scope must only constrain the drag-protection logic
+        # (`_prepare_drag_dynamic_compensation`), never the kinematic followers
+        # themselves.
         for rigid in self.model.rigid_bodies:
             if rigid.mode == MODE_STATIC or include_dynamic:
                 matrices[rigid.index] = self._current_body_matrix(rigid)
@@ -893,6 +1134,33 @@ class PhysicsWorld:
             if bone_matrix is not None:
                 return bone_matrix @ rigid.bone_offset_matrix
         return self.model.root.matrix_world.inverted_safe() @ rigid.obj.matrix_world
+
+    def _interaction_affected_static_indices(self):
+        pose_bones = getattr(self, "_interaction_pose_scope", None)
+        if pose_bones is None:
+            self.performance["interaction_static_scope_count"] = 0
+            return None
+        indices = self._interaction_static_indices_for_pose_scope(pose_bones)
+        if not indices:
+            self.performance["interaction_static_scope_count"] = 0
+            self.performance["interaction_static_bodies"] = ""
+            return set()
+        self.performance["interaction_static_scope_count"] = len(indices)
+        self.performance["interaction_static_bodies"] = self._format_debug_names(
+            self._rigid_names_for_indices(indices),
+            limit=8,
+        )
+        return indices
+
+    def _rigid_names_for_indices(self, indices):
+        if self.model is None:
+            return []
+        index_set = set(indices or [])
+        names = []
+        for rigid in self.model.rigid_bodies:
+            if rigid.index in index_set:
+                names.append(rigid.name or rigid.obj.name or str(rigid.index))
+        return names
 
     def _rest_body_matrix(self, rigid):
         if rigid.bone_name and rigid.bone_offset_matrix is not None:
@@ -934,6 +1202,7 @@ class PhysicsWorld:
         armature_inverse = armature.matrix_world.inverted_safe() if armature is not None else None
         bone_targets = {}
         object_writes = 0
+        dynamic_scope = self._interaction_affected_dynamic_indices()
 
         update_objects = bool(self.apply_options.get("update_rigid_objects", True))
         skip_objects = (
@@ -953,6 +1222,13 @@ class PhysicsWorld:
 
             if rigid.mode not in {MODE_DYNAMIC, MODE_DYNAMIC_BONE}:
                 continue
+            # Out-of-scope dynamic bodies are now allowed to free-run during
+            # pose-mode interactions, so we still need to write their pose-bone
+            # matrices back; otherwise the mesh would lag behind the physics
+            # bodies. The scope still gates `_prepare_drag_dynamic_compensation`
+            # and `_current_body_matrices`, which is enough to keep cloth/hair
+            # decoupled from the dragged region.
+            _ = dynamic_scope  # kept for performance metrics only
             if armature is None or armature_inverse is None or not rigid.bone_name or rigid.bone_offset_matrix is None:
                 continue
 
@@ -980,6 +1256,7 @@ class PhysicsWorld:
         }
         applied_matrices = {}
         bone_writes = 0
+        written_bone_names = []
         for bone_name, (pose_bone, mode, bone_matrix_armature) in ordered_items:
             if mode == MODE_DYNAMIC:
                 target_matrix = bone_matrix_armature
@@ -1004,9 +1281,20 @@ class PhysicsWorld:
             )
             self._last_written_bone_targets[bone_name] = target_matrix.copy()
             bone_writes += 1
+            written_bone_names.append(bone_name)
             applied_matrices[bone_name] = target_matrix
         self.performance["last_bone_writes"] = bone_writes
         self.performance["last_object_writes"] = object_writes
+        self.performance["interaction_written_bones"] = self._format_debug_names(written_bone_names)
+
+    @staticmethod
+    def _format_debug_names(names, limit=10):
+        names = [str(name) for name in names if name]
+        if not names:
+            return ""
+        shown = names[:limit]
+        suffix = f" +{len(names) - limit}" if len(names) > limit else ""
+        return ", ".join(shown) + suffix
 
     def _build_runtime_cache(self):
         armature = self.model.armature if self.model is not None else None

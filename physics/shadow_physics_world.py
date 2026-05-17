@@ -27,6 +27,10 @@ class ShadowPhysicsWorld:
         self.apply_options = {}
         self.performance = _new_performance()
 
+    def set_interaction_pose_scope(self, pose_bones=None):
+        for world in self._active_worlds():
+            world.set_interaction_pose_scope(pose_bones)
+
     def initialize(
         self,
         context,
@@ -138,6 +142,20 @@ class ShadowPhysicsWorld:
             world.reset_to_current_pose(prewarm_steps=prewarm_steps)
         self._update_shadow_bodies()
         self.flush_depsgraph()
+
+    def sync_kinematic_only(self):
+        count = 0
+        for world in self._active_worlds():
+            count += world.sync_kinematic_only()
+        self._update_shadow_bodies()
+        return count
+
+    def interaction_snap_dynamic_bones(self, clear_velocity=False, pose_bones=None):
+        count = 0
+        for world in self._active_worlds():
+            count += world.interaction_snap_dynamic_bones(clear_velocity=clear_velocity, pose_bones=pose_bones)
+        self._update_shadow_bodies()
+        return count
 
     def flush_depsgraph(self):
         for world in self._active_worlds():
@@ -308,6 +326,11 @@ class ShadowPhysicsWorld:
         self.performance["max_smoothing_segments"] = max((int(perf.get("max_smoothing_segments", 1)) for perf in perfs), default=1)
         self.performance["last_bone_writes"] = sum(int(perf.get("last_bone_writes", 0)) for perf in perfs)
         self.performance["last_object_writes"] = sum(int(perf.get("last_object_writes", 0)) for perf in perfs)
+        self.performance["interaction_static_scope_count"] = sum(int(perf.get("interaction_static_scope_count", 0)) for perf in perfs)
+        self.performance["interaction_dynamic_scope_count"] = sum(int(perf.get("interaction_dynamic_scope_count", 0)) for perf in perfs)
+        self.performance["interaction_frozen_dynamic_count"] = sum(int(perf.get("interaction_frozen_dynamic_count", 0)) for perf in perfs)
+        written = [str(perf.get("interaction_written_bones", "")) for perf in perfs if perf.get("interaction_written_bones", "")]
+        self.performance["interaction_written_bones"] = " | ".join(written)[:240]
         self.performance["last_contact_pairs"] = len(self.models) * max(0, len(self.models) - 1) // 2
         self.performance["last_shared_active_models"] = len(self.models)
         self.performance["last_changed_models"] = 0

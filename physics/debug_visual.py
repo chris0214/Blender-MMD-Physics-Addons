@@ -118,8 +118,7 @@ def clear_debug_visuals():
     return restored
 
 
-def apply_debug_visuals(context, root, mode="BODY_MODE", force_visible=True):
-    clear_debug_visuals()
+def _apply_model_debug_visuals(context, root, mode, force_visible):
     model = pmx_data_reader.read_model(context, root)
     state = _state()
     count = 0
@@ -153,3 +152,20 @@ def apply_debug_visuals(context, root, mode="BODY_MODE", force_visible=True):
         count += 1
 
     return count
+
+
+def apply_debug_visuals(context, root, mode="BODY_MODE", force_visible=True):
+    clear_debug_visuals()
+    return _apply_model_debug_visuals(context, root, mode, force_visible)
+
+
+def apply_debug_visuals_for_roots(context, roots, mode="BODY_MODE", force_visible=True):
+    clear_debug_visuals()
+    total = 0
+    models = 0
+    for root in roots:
+        if root is None:
+            continue
+        total += _apply_model_debug_visuals(context, root, mode, force_visible)
+        models += 1
+    return models, total

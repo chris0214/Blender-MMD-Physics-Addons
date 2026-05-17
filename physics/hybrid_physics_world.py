@@ -46,6 +46,12 @@ class HybridPhysicsWorld:
         self.apply_options = {}
         self.performance = _new_performance()
 
+    def set_interaction_pose_scope(self, pose_bones=None):
+        for world in self._active_worlds():
+            world.set_interaction_pose_scope(pose_bones)
+        if self._shared_world is not None:
+            self._shared_world.set_interaction_pose_scope(pose_bones)
+
     def initialize(
         self,
         context,
@@ -200,6 +206,22 @@ class HybridPhysicsWorld:
         if self._shared_world is not None:
             self._shared_world.reset_to_current_pose(prewarm_steps=prewarm_steps)
         self.flush_depsgraph()
+
+    def sync_kinematic_only(self):
+        count = 0
+        for world in self._active_worlds():
+            count += world.sync_kinematic_only()
+        if self._shared_world is not None:
+            count += self._shared_world.sync_kinematic_only()
+        return count
+
+    def interaction_snap_dynamic_bones(self, clear_velocity=False, pose_bones=None):
+        count = 0
+        for world in self._active_worlds():
+            count += world.interaction_snap_dynamic_bones(clear_velocity=clear_velocity, pose_bones=pose_bones)
+        if self._shared_world is not None:
+            count += self._shared_world.interaction_snap_dynamic_bones(clear_velocity=clear_velocity, pose_bones=pose_bones)
+        return count
 
     def flush_depsgraph(self):
         for world in self._active_worlds():
@@ -646,6 +668,11 @@ class HybridPhysicsWorld:
         self.performance["max_smoothing_segments"] = max(int(perf.get("max_smoothing_segments", 1)) for perf in perfs)
         self.performance["last_bone_writes"] = sum(int(perf.get("last_bone_writes", 0)) for perf in perfs)
         self.performance["last_object_writes"] = sum(int(perf.get("last_object_writes", 0)) for perf in perfs)
+        self.performance["interaction_static_scope_count"] = sum(int(perf.get("interaction_static_scope_count", 0)) for perf in perfs)
+        self.performance["interaction_dynamic_scope_count"] = sum(int(perf.get("interaction_dynamic_scope_count", 0)) for perf in perfs)
+        self.performance["interaction_frozen_dynamic_count"] = sum(int(perf.get("interaction_frozen_dynamic_count", 0)) for perf in perfs)
+        written = [str(perf.get("interaction_written_bones", "")) for perf in perfs if perf.get("interaction_written_bones", "")]
+        self.performance["interaction_written_bones"] = " | ".join(written)[:240]
         self.performance["last_contact_pairs"] = len(self._last_contact_pairs)
         self.performance["last_contact_detect_ms"] = float(self._last_contact_detect_ms)
         self.performance["last_shared_active_models"] = len(self._shared_indices)

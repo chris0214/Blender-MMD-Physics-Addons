@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import bpy
 
 from ..physics import bake, debug_visual, physics_sync, pmx_data_reader
@@ -307,6 +309,42 @@ class PMXPHYSICS_OT_apply_debug_visuals(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class PMXPHYSICS_OT_apply_all_debug_visuals(bpy.types.Operator):
+    bl_idname = "pmx_physics.apply_all_debug_visuals"
+    bl_label = "Apply All Debug Visuals"
+    bl_description = "Show PMX rigid bodies and joints for all enabled models"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        roots = [item.root for item in settings.model_roots if item.root is not None and item.enabled]
+        if not roots:
+            root = settings.model_root or pmx_data_reader.find_root_object(context.active_object)
+            if root is not None:
+                roots = [root]
+        if not roots:
+            settings.status = iface_("No enabled models in list")
+            self.report({"ERROR"}, settings.status)
+            return {"CANCELLED"}
+        try:
+            models, count = debug_visual.apply_debug_visuals_for_roots(
+                context,
+                roots,
+                settings.debug_visual_mode,
+                settings.debug_force_visible,
+            )
+        except Exception as exc:
+            settings.status = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        settings.status = (
+            f"{iface_('Debug visualized')} {models} {iface_('model(s)')} / "
+            f"{count} {iface_('objects')}"
+        )
+        self.report({"INFO"}, settings.status)
+        return {"FINISHED"}
+
+
 class PMXPHYSICS_OT_clear_debug_visuals(bpy.types.Operator):
     bl_idname = "pmx_physics.clear_debug_visuals"
     bl_label = "Clear Debug Visuals"
@@ -317,6 +355,42 @@ class PMXPHYSICS_OT_clear_debug_visuals(bpy.types.Operator):
         settings = _settings(context)
         count = debug_visual.clear_debug_visuals()
         settings.status = f"{iface_('Cleared debug visuals')} {count} {iface_('objects')}"
+        return {"FINISHED"}
+
+
+class PMXPHYSICS_OT_dump_interaction_debug(bpy.types.Operator):
+    bl_idname = "pmx_physics.dump_interaction_debug"
+    bl_label = "Dump Interaction Debug"
+    bl_description = "Write the latest interaction diagnostics to a text report"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = _settings(context)
+        report_path = Path("N:/Blender-Physics/interaction_debug_report.txt")
+        lines = [
+            "MikuMikuPhysics Interaction Debug",
+            f"Status: {settings.status}",
+            f"Kind: {settings.interaction_debug_kind}",
+            f"Scope: {settings.interaction_debug_scope}",
+            f"Static Count: {settings.interaction_debug_static_count}",
+            f"Dynamic Count: {settings.interaction_debug_dynamic_count}",
+            f"Frozen Dynamic Count: {settings.interaction_debug_frozen_count}",
+            f"Static Bodies: {settings.interaction_debug_static_bodies}",
+            f"Dynamic Bodies: {settings.interaction_debug_dynamic_bodies}",
+            f"Written Bones: {settings.interaction_debug_written_bones}",
+            "",
+            "Performance",
+            f"Bodies: {settings.perf_body_count}",
+            f"Joints: {settings.perf_joint_count}",
+            f"Pairs: {settings.perf_pair_count}",
+            f"Timer Tick ms: last={settings.perf_last_tick_ms:.3f}, avg={settings.perf_avg_tick_ms:.3f}, max={settings.perf_max_tick_ms:.3f}",
+            f"World Step ms: last={settings.perf_last_step_ms:.3f}, avg={settings.perf_avg_step_ms:.3f}, max={settings.perf_max_step_ms:.3f}",
+            f"Native ms: last={settings.perf_last_native_ms:.3f}, avg={settings.perf_avg_native_ms:.3f}, max={settings.perf_max_native_ms:.3f}",
+            f"Apply ms: last={settings.perf_last_apply_ms:.3f}, avg={settings.perf_avg_apply_ms:.3f}, max={settings.perf_max_apply_ms:.3f}",
+        ]
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        settings.status = f"Interaction debug written: {report_path}"
+        self.report({"INFO"}, settings.status)
         return {"FINISHED"}
 
 
